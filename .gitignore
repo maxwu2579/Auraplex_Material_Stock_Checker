@@ -1,0 +1,39 @@
+# Python / environments
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Packaging output (the Portable ZIP is published as a GitHub Release asset, not committed)
+build/
+dist/
+*.spec
+
+# Logs and local settings
+*.log
+.env
+.env.*
+
+# Workbooks and reports: never commit business data or generated reports.
+# Automated tests create their own synthetic workbooks in a temporary folder.
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+~$*
+test-artifacts/
+
+# Internal development records and the real-data verification tool.
+# They refer to company files and are kept out of the public repository.
+/M0_*.md
+/M1_*.md
+/M2_*.md
+/TEST_REPORT.md
+/DATA_LIMITATIONS.md
+/tests/verify_real.py
+
+# OS / sync metadata
+.DS_Store
+Thumbs.db
+desktop.ini

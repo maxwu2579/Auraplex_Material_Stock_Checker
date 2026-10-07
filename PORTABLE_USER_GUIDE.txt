@@ -1,0 +1,44 @@
+Auraplex Material Stock Checker v1.0.0
+======================================
+
+Requirements
+------------
+- Windows 10 or 11
+- Google Drive for Desktop
+- Access to the shared Auraplex data folder
+
+How to use
+----------
+1.  Install and sign in to Google Drive for Desktop.
+2.  Make sure the shared Auraplex folder is available.
+3.  Extract the Portable ZIP to a folder on this computer
+    (for example Desktop or Documents). Keep the whole folder together.
+4.  Double-click Auraplex_Material_Stock_Checker.exe.
+5.  Select the Storage Excel file.
+6.  Select the BOM Excel file.
+7.  Select or search the Product ID.
+8.  Enter the Production Quantity.
+9.  Click CHECK MATERIALS.
+10. Review the results:
+      Red    = Shortage
+      Yellow = Exception (the source data needs checking)
+      White  = Enough
+11. Click EXPORT EXCEL to create the report.
+
+Good to know
+------------
+- The tool only reads the Storage and BOM files. It never changes them.
+- The report is always saved as a new Excel file.
+- Results use the files as last saved. If someone has a file open in
+  Excel with unsaved changes, those changes are not included.
+- Yellow rows marked "ASSUMED 0" were calculated with a stock of 0
+  because the stock value was missing or not a number.
+- Results are calculations to support checking. They are not a
+  production approval.
+
+First start
+-----------
+Windows may show "Windows protected your PC" because this internal tool
+is not digitally signed. If you downloaded it from the official Auraplex
+release page, choose "More info" and then "Run anyway". If you are not
+sure where the file came from, do not run it and ask your administrator.
