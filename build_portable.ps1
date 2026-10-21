@@ -2,10 +2,29 @@
 #   dist\Auraplex_Material_Stock_Checker\                      (exe, _internal, README.txt)
 #   dist\Auraplex_Material_Stock_Checker_v<version>_Portable.zip
 # Uses only the project .venv (run Setup.bat first). Nothing is installed globally.
-param([string]$Version = '1.0.0')
+#
+#   build_portable.bat -Version 1.1.0                         release build; must equal VERSION in app.py
+#   build_portable.bat -Version 1.1.0.dev0 -AllowDevBuild     development build, never a release package
+#   ... -ValidateOnly                                         check the version arguments only, build nothing
+#
+# There is no default version: a stale default once labelled newer code as an older release.
+# The version is checked before anything else, so a refused run never cleans build\ or dist\.
+param([string]$Version = '', [switch]$AllowDevBuild, [switch]$ValidateOnly)
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $name = 'Auraplex_Material_Stock_Checker'
+
+$source = Get-Content -LiteralPath (Join-Path $root 'app.py') -Raw -Encoding UTF8
+if ($source -notmatch '(?m)^VERSION\s*=\s*"([^"]+)"') { throw 'VERSION not found in app.py.' }
+$appVersion = $Matches[1]
+if (-not $Version) { throw "Pass the version explicitly, e.g. -Version $appVersion (app.py VERSION = $appVersion)." }
+if ($Version -cne $appVersion) { throw "-Version $Version does not match app.py VERSION = $appVersion. Nothing was built." }
+$development = $appVersion -match '(?i)(dev\d*|a\d+|b\d+|rc\d+)$'
+if ($development -and -not $AllowDevBuild) {
+    throw "$appVersion is a development version and must not be packaged as a release. Use -AllowDevBuild for a test build."
+}
+Write-Host "Version $Version (app.py)$(if ($development) { ' - development build, not for release' })"
+if ($ValidateOnly) { return }
 $python = Join-Path $root '.venv\Scripts\python.exe'
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) { throw 'Project .venv not found. Run Setup.bat first.' }
 

@@ -3,16 +3,23 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from copy import copy
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
+import tempfile
 
 from openpyxl import Workbook
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+from openpyxl.comments import Comment
 from openpyxl.styles import Font
 
 from .core import CheckResult, EXCEPTION, ROW_CAVEAT, SHORTAGE, WorkbookData
 from .report_style import FILLS, HEADER_ROW, METADATA_START, NOTE_ROW, format_report
+from . import binding
+from .sync import content_signature
 
 
 class ReportError(ValueError):
@@ -138,3 +145,83 @@ def save_report(path: str | Path, result: CheckResult, stock_book: WorkbookData,
     target = safe_target(path, (stock_book.path, bom_book.path))
     build_report(result, stock_book, bom_book, generated or datetime.now()).save(target)
     return target
+
+
+def _export_provenance(book, checked, verified):
+    """Keep the two M2 tables intact; provenance occupies the unused row 8 and source-cell comments."""
+    checked_at = datetime.fromtimestamp(checked.checked_at).astimezone().isoformat(timespec="microseconds")
+    verified_at = datetime.fromtimestamp(verified.checked_at).astimezone().isoformat(timespec="microseconds")
+    note = (f"Local versions checked for export: {verified_at} | Cloud Not Verified. "
+            "Point-in-time local check only; sources can change afterwards.")
+    for sheet in book:
+        sheet.merge_cells(start_row=8, start_column=1, end_row=8, end_column=sheet.max_column)
+        _write_row(sheet, 8, (note,))
+        sheet['A8'].alignment = copy(sheet['A9'].alignment)
+        sheet.row_dimensions[8].height = 30
+        for role, row in (("stock", 5), ("bom", 6)):
+            version = checked.versions[role]
+            metadata = {"source": binding.ROLE_NAMES[role], "path": version[0], "size_bytes": version[1],
+                        "mtime_ns": version[2], "ctime_ns": version[3], "device": version[4], "inode": version[5],
+                        "content_signature": content_signature(version),
+                        "version_id": hashlib.sha256(json.dumps(version, ensure_ascii=False).encode('utf-8')).hexdigest(),
+                        "check_verified_at": checked_at, "export_verified_at": verified_at,
+                        "scope": "Local file version at verification time only; Cloud Not Verified"}
+            sheet.cell(row, 3).comment = Comment(json.dumps(metadata, ensure_ascii=False, indent=2), "Material Stock Checker")
+
+
+def save_verified_report(path, result, stock_book, bom_book, source_binding, source_paths):
+    """Application export boundary: stage privately, recheck, then publish a new file without overwriting.
+
+    No retries or SQLite reads; failures leave no final report. The low-level save_report remains available for
+    formatting raw calculation data, whereas the application's exports must use this version-bound boundary.
+    """
+    paths = dict(source_paths)
+    checked = source_binding
+    verified = binding.verify_export(checked, paths)
+    for role, source in (("stock", stock_book), ("bom", bom_book)):
+        if source.fingerprint != checked.versions[role]:
+            confirmed = dict(verified.confirmed)
+            confirmed[role] = None
+            failed = binding.SourceBinding(dict(checked.versions), confirmed, verified.via_sync,
+                                           verified.checked_at, checked.attempts)
+            raise binding.ExportVerificationError(failed, f"{binding.ROLE_NAMES[role]} report data differs from CHECK.")
+    sources = (stock_book.path, bom_book.path)
+    target = safe_target(path, sources)
+    descriptor, temporary = tempfile.mkstemp(prefix=".mrc-export-", suffix=".xlsx", dir=target.parent)
+    os.close(descriptor)
+    failure = None
+    try:
+        book = build_report(result, stock_book, bom_book, datetime.now())
+        try:
+            _export_provenance(book, checked, verified)
+            book.save(temporary)
+        finally:
+            book.close()
+        # This last observation is after report generation. The report conservatively records the earlier
+        # completed export verification, not a future timestamp that was not known when the workbook was saved.
+        for _ in range(10):
+            target = safe_target(path, sources)
+            binding.verify_export(checked, paths)
+            try:
+                if os.name == "nt":
+                    os.rename(temporary, target)  # Windows refuses an existing destination atomically
+                else:
+                    os.link(temporary, target)    # same no-overwrite contract on POSIX
+                return target
+            except FileExistsError:
+                continue
+        raise ReportError("报告目标持续被其他程序创建；未发布报告，请选择其他名称。")
+    except BaseException as exc:
+        failure = exc
+        raise
+    finally:
+        try:
+            os.unlink(temporary)  # only our own staging file; never an Excel source or another report
+        except FileNotFoundError:
+            pass  # Windows publication already consumed it, or another cleanup removed it
+        except OSError as cleanup:
+            if failure is None:
+                raise
+            # Cleanup must never replace a source-verification failure (or the original write error).
+            # The UI can still invalidate the binding and show where a staging file may remain.
+            failure.cleanup_warning = f"Temporary report cleanup failed: {temporary}\n{cleanup}"
