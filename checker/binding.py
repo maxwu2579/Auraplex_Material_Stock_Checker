@@ -93,7 +93,7 @@ def verify_export(bound: SourceBinding, paths: dict) -> SourceBinding:
     observation, never a guarantee of continued local stability or of Google Drive cloud freshness.
     A failed CHECK binding cannot be made exportable again here: the user must CHECK again.
     """
-    if bound is None or set(bound.versions) != set(ROLE_NAMES) or not bound.current:
+    if not isinstance(bound, SourceBinding) or set(bound.versions) != set(ROLE_NAMES) or not bound.current:
         raise ExportVerificationError(bound, "CHECK source versions are unverified; please CHECK again.")
     confirmed, reasons = {}, []
     for _ in range(2):

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from dataclasses import replace
 from pathlib import Path
 import os
 import queue
@@ -12,7 +13,7 @@ from tkinter import font as tkfont
 
 from .core import (DataReadError, ENOUGH, EXCEPTION, ROW_CAVEAT, SHORTAGE, check_materials, display,
                    production_quantity, search_products, select_product)
-from . import binding
+from . import binding, cached, retention
 from .queries import overall_state, overall_times, status_text, with_known_failures
 from .sync import (CHECKING, CLOUD_NOT_VERIFIED, DATABASE_UNAVAILABLE, LOCAL_VERIFIED, NOT_SYNCED, SOURCE_CHANGED,
                    SOURCE_UNAVAILABLE, STATUS_UNKNOWN, SYNC_FAILED, USING_PREVIOUS)
@@ -27,7 +28,8 @@ SHEET_GONE = "源文件更新后，所选 Sheet 不再存在/不符合表头。�
 ROLE_NAMES = {"stock": "Storage", "bom": "BOM"}
 NOTICE_TEXT = "Results are calculated from the selected BOM and current saved Storage data."
 SHORT_TIME = "%Y-%m-%d %H:%M"  # compact panel; the details popup shows seconds
-JOB_STATUS = {"检查材料": "Checking materials…", "启动检查": "Checking Excel sources…", "刷新 Excel": "Refreshing Excel…"}
+JOB_STATUS = {"检查材料": "Checking materials…", "启动检查": "Checking Excel sources…", "刷新 Excel": "Refreshing Excel…",
+              "预览历史清理": "Preparing local cleanup preview…", "清理历史数据": "Backing up and cleaning local history…"}
 LOCAL_COPY_NOTE = ("Local File Checked = at the Last Verified time, the database matched one version of the Excel file "
                    "on this computer. The file can change at any moment afterwards, and Google Drive may not have "
                    "downloaded newer cloud changes yet: the cloud copy is never checked (Cloud Not Verified).")
@@ -58,6 +60,9 @@ class CheckerApp:
         self.sync_failures = {}    # role -> failed SyncResult seen by this program; beats older SQLite records
         self.stock_book = self.bom_book = self.result = None
         self.result_binding = None # binding.SourceBinding of the shown result: which source versions it belongs to
+        self.cache_selection = None  # explicit opt-in for this session only; never restored from settings
+        self.cache_authorized = False
+        self.maintenance_message = ''
         self.busy = False
         self.closed = False
         self.cancelled = threading.Event()
@@ -138,12 +143,22 @@ class CheckerApp:
         self.overview_content.bind("<Configure>", lambda _e: self.overview_canvas.configure(scrollregion=self.overview_canvas.bbox("all")))
         heading = ttk.Frame(self.overview_content)
         heading.grid(row=0, sticky="ew", pady=(0, 12))
+        if self.inventory is not None:
+            self.cache_button = ttk.Button(heading, text="Use Cached Data…", command=self.use_cached_data,
+                                           padding=(8, 3))
+            self.cache_button.pack(side="right", padx=(12, 0))
+            self.maintenance_button = ttk.Button(heading, text="Local History…", command=self.preview_cleanup,
+                                                 padding=(8, 3))
+            self.maintenance_button.pack(side="right", padx=(8, 0))
         ttk.Label(heading, text="Material Requirement & Stock Checker", style="Title.TLabel").pack(anchor="w")
         ttk.Label(heading, text="Check material requirements against current stock.", style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
         files = ttk.Frame(self.overview_content)
         files.grid(row=1, sticky="ew", pady=(0, 12))
         files.columnconfigure((0, 1), weight=1, uniform="files")
         self.controls = []
+        if self.inventory is not None:
+            self.controls.append((self.cache_button, "normal"))
+            self.controls.append((self.maintenance_button, "normal"))
         for col, role in enumerate(("stock", "bom")):
             card = ttk.Frame(files, style="Card.TFrame", padding=(12, 8))
             card.grid(row=0, column=col, sticky="nsew", padx=(0, 6) if col == 0 else (6, 0))
@@ -208,6 +223,7 @@ class CheckerApp:
         self.db_panel = None
         if self.inventory is not None or self.inventory_error is not None:
             self._build_inventory_panel(notice)
+        self.mode_label = self.notice_label  # Permanent mode warning without an extra pinned row.
         summary = ttk.Frame(outer)
         summary.grid(row=4, sticky="ew", pady=(0, 12))
         for col, (key, title, hint, colour) in enumerate((("total", "Total Materials", "Material rows", INK),
@@ -506,10 +522,95 @@ class CheckerApp:
         self._start(lambda: {role: self._read(role, path) for role, path in remembered.items()}, self._loaded,
                     "启动检查", sync=(remembered, "startup"))
 
+    def preview_cleanup(self):
+        """Manual maintenance only. Preview, explicit No-default consent, then a separate guarded worker."""
+        if self.busy:
+            return
+        if self.inventory is None:
+            messagebox.showerror('Local History', 'A readable local database is required.', parent=self.root)
+            return
+        service = retention.RetentionService(self.inventory.db_path)
+        def done(result):
+            self.maintenance_message = ('Local history cleanup completed' if result.backup else 'Nothing expired')
+            messagebox.showinfo('Local History', self.maintenance_message +
+                                ('\nRecovery backup: ' + result.backup if result.backup else '\nNo data deleted.'),
+                                parent=self.root)
+        def offer(plan):
+            self.maintenance_message = 'Cleanup preview only; no data deleted'
+            if plan.empty:
+                messagebox.showinfo('Local History', plan.describe() + '\n\nNothing expired. No data deleted.', parent=self.root)
+                return
+            job = self.job
+            answer = messagebox.askyesno('Confirm local history cleanup?', plan.describe() +
+                                        '\n\nCreate a backup and delete ONLY these expired local records?',
+                                        parent=self.root, default='no')
+            if not answer or self.closed or self.busy or job != self.job:
+                return
+            self._start(lambda: service.apply(plan, self.cancelled), done, '清理历史数据')
+        self._start(service.preview, offer, '预览历史清理')
+
+    def use_cached_data(self):
+        """Read-only preview on a worker; only an affirmative, current dialog enables historical mode."""
+        if self.busy:
+            return
+        if self.inventory is None:
+            messagebox.showerror("Cache unavailable", "A readable local database is required.", parent=self.root)
+            return
+        database = self.inventory.db_path
+        def offer(snapshot):
+            job = self.job
+            accepted = messagebox.askyesno("Use historical cached data?", snapshot.describe() +
+                "\n\n仅用于历史试算。不是生产批准。使用上述两个缓存版本？", parent=self.root, default="no")
+            if not accepted or self.busy or job != self.job:
+                return
+            self.cache_selection = snapshot
+            self.cache_authorized = True
+            self.stock_path.set(snapshot.stock.path)
+            self.bom_path.set(snapshot.bom.path)
+            self._stock_loaded(snapshot.stock)
+            self._bom_loaded(snapshot.bom)
+            self.mode_label.configure(text=cached.LABEL + " · Cloud Not Verified", foreground="#b00020")
+            for role in ROLES:
+                self.file_view[role]["locks"] = ()
+                self.file_status[role].set(snapshot.describe())
+                self._refresh_file_card(role)
+        self._start(lambda: cached.load(database), offer, "读取历史缓存")
+
+    def _leave_cache(self, clear=False):
+        if self.cache_selection is None:
+            return
+        self.cache_selection = None
+        self.cache_authorized = False
+        self.mode_label.configure(text=NOTICE_TEXT, foreground=MUTED)
+        if clear:
+            for role in ROLES:
+                self._clear_role(role)
+        for role in ROLES:
+            self._refresh_file_card(role)
+
+    def _check_cached(self, selected, count):
+        if not self.cache_authorized:
+            messagebox.showerror(binding.OUTDATED, "缓存授权已失效。请点击 Use Cached Data 重新确认版本。", parent=self.root)
+            return
+        snapshot = self.cache_selection
+        def action():
+            cached.verify(snapshot)
+            product = self.service.find_product(snapshot.bom, selected['bom'])
+            sheet = self.service.find_stock_sheet(snapshot.stock, selected['stock'])
+            if product is None or sheet is None:
+                raise cached.CacheError("Select an existing cached product and Storage sheet.")
+            result = check_materials(product, sheet, count)
+            cached.verify(snapshot)
+            return result, cached.CacheBinding(snapshot, time.time())
+        def done(data):
+            self.render_result(*data)
+        self._start(action, done, "检查历史缓存")
+
     def refresh_excel(self):
         """Check both sources for updates, synchronise changed files and refresh what is shown. Never writes Excel."""
         if self.busy:
             return
+        self._leave_cache()
         if self.result is not None:
             self.check(trigger="manual")  # same Product ID, quantity and Storage sheet, recalculated from the files
         else:
@@ -552,7 +653,8 @@ class CheckerApp:
         if self.db_panel is None:
             self.notice_label.configure(wraplength=width)
         else:  # one line beside Refresh Excel; the full sentence is in the tooltip
-            self.notice_label.configure(text=ellipsize(NOTICE_TEXT, width - self.refresh_button.winfo_reqwidth() - 8,
+            self.notice_label.configure(text=ellipsize(cached.LABEL if self.cache_selection else NOTICE_TEXT,
+                                                       width - self.refresh_button.winfo_reqwidth() - 8,
                                                        ("Segoe UI", 9)))
         if self.export_path.get():
             self.export_feedback_label.configure(text=ellipsize(self.export_path.get(), width - 180, ("Segoe UI", 9), middle=True))
@@ -602,7 +704,8 @@ class CheckerApp:
         view["path"].configure(text=ellipsize(str(Path(path).parent) if path else ".xlsx / .xlsm", width, ("Segoe UI", 9), middle=True))
         view["button"].configure(text="Change…" if path else "Browse…")
         if book:
-            status = f"Loaded · Saved {clock(book.fingerprint[2] / 1e9)} · Loaded {clock(book.loaded_at)}"
+            status = (f"{cached.LABEL} · Imported {clock(book.loaded_at)}" if self.cache_selection else
+                      f"Loaded · Saved {clock(book.fingerprint[2] / 1e9)} · Loaded {clock(book.loaded_at)}")
         else:
             status = "Loading…" if view["loading"] else "Load failed · Click for details" if path else "Not loaded"
         view["status"].configure(text=ellipsize(status, width, ("Segoe UI", 9)))
@@ -637,6 +740,7 @@ class CheckerApp:
     def invalidate(self):
         self.result = None
         self.result_binding = None
+        self.export_feedback.grid_remove()
         children = self.tree.get_children()
         if children:
             self.tree.delete(*children)
@@ -652,9 +756,21 @@ class CheckerApp:
         """The shown result was confirmed after calculation; export requires a new local source check."""
         return self.result is not None and self.result_binding is not None and self.result_binding.current
 
+    @property
+    def result_exportable(self):
+        if isinstance(self.result_binding, cached.CacheBinding):
+            return (self.result is not None and self.result_binding.valid and self.cache_authorized
+                    and self.cache_selection is not None
+                    and self.result_binding.snapshot.token == self.cache_selection.token
+                    and self._export_sources() == {v.role: v.path for v in self.cache_selection.versions})
+        return self.result_current
+
     def _show_result_state(self):
         if self.result is None or self.result_binding is None:
             self.result_state_label.configure(text="", foreground=MUTED, font=("Segoe UI", 9))
+        elif isinstance(self.result_binding, cached.CacheBinding):
+            self.result_state_label.configure(text=cached.LABEL if self.result_exportable else binding.OUTDATED,
+                                              foreground="#b00020", font=("Segoe UI", 9, "bold"))
         elif self.result_binding.current:
             when = datetime.fromtimestamp(self.result_binding.checked_at).strftime("%H:%M:%S")
             self.result_state_label.configure(text=f"Local Sources Verified {when}", foreground="#3b715e",
@@ -664,7 +780,7 @@ class CheckerApp:
             self.result_state_label.configure(text=f"{binding.OUTDATED} · {changed} changed", foreground="#b00020",
                                               font=("Segoe UI", 9, "bold"))
         if not self.busy:  # an outdated result can never be exported
-            self.export_button.configure(state="normal" if self.result is None or self.result_current else "disabled")
+            self.export_button.configure(state="normal" if self.result is None or self.result_exportable else "disabled")
 
     def _set_busy(self, busy):
         self.busy = busy
@@ -736,7 +852,25 @@ class CheckerApp:
             # Every outcome, failures included, shows the current database state (and its cloud limitation).
             db_suffix = (f" · Inventory Database: {status_text(self.db_overall)}"
                          if report is not None and self.db_panel is not None else "")
-            if error is not None:
+            if isinstance(error, retention.RetentionError):
+                if isinstance(error, retention.RetentionReadError):
+                    self.inventory_roles = {}
+                    self.inventory_read_error = str(error)
+                    self._render_inventory()
+                    if self.cache_selection is not None:
+                        self.cache_authorized = False
+                        self.mode_label.configure(text=cached.LABEL + ' · Reselect required', foreground='#b00020')
+                self.status.set('Local history maintenance refused/failed · ' + CLOUD_NOT_VERIFIED)
+                messagebox.showerror('Local History', str(error), parent=self.root)
+            elif error is not None:
+                if isinstance(error, cached.CacheError) and self.cache_selection is not None:
+                    self.cache_authorized = False
+                    self.mode_label.configure(text=cached.LABEL + " · Reselect required", foreground="#b00020")
+                if isinstance(error, cached.CacheReadError):
+                    self.inventory_roles = {}
+                    self.inventory_read_error = str(error)
+                    self._render_inventory()
+                    db_suffix = f" · Inventory Database: {status_text(self.db_overall)}"
                 # Unexpected failure of the whole action: nothing loaded can be trusted, so clear everything.
                 for role in ROLES:
                     self.file_view[role]["loading"] = False
@@ -747,12 +881,21 @@ class CheckerApp:
             else:
                 # A callback returns text when a file failed; it has already cleared only that file.
                 problem = callback(data)
+                if self.closed:
+                    return
+                if job != self.job:  # a modal confirmation may have started a new, guarded worker
+                    self.poll_id = self.root.after(50, self._poll)
+                    return
                 if problem:
                     self.invalidate()
                     self.status.set("Read / check failed · Click the file card for details." + db_suffix)
                     messagebox.showerror("读取/检查失败", "\n\n".join(x for x in (problem, sync_note) if x), parent=self.root)
                 else:
-                    if self.result and not self.result_current:
+                    if label in ('预览历史清理', '清理历史数据'):
+                        status = self.maintenance_message + ' · ' + CLOUD_NOT_VERIFIED
+                    elif self.cache_selection is not None:
+                        status = cached.LABEL + " · Cloud Not Verified · Historical data only"
+                    elif self.result and not self.result_current:
                         status = (f"{binding.OUTDATED} · the source changed while being checked "
                                   f"({self.result_binding.attempts} attempts); export disabled. Click CHECK again.")
                     elif self.result:
@@ -830,6 +973,7 @@ class CheckerApp:
     def load_file(self, role, path):
         if self.busy:
             return
+        self._leave_cache(clear=True)
         (self.stock_path if role == "stock" else self.bom_path).set(path)
         self.file_view[role]["loading"] = True
         self._clear_role(role)
@@ -874,6 +1018,7 @@ class CheckerApp:
     def reload_files(self, force=True, trigger="reload", label="强制重新读取"):
         if self.busy:
             return
+        self._leave_cache()
         paths = {"stock": self.stock_path.get(), "bom": self.bom_path.get()}
         product = select_product(self.bom_book.products, self.product_text.get()) if self.bom_book else None
         previous = {"stock": self.stock_name.get(), "bom": product.sheet_name if product else ""}
@@ -908,6 +1053,9 @@ class CheckerApp:
         paths = {"stock": self.stock_path.get(), "bom": self.bom_path.get()}
         selected = {"stock": self.stock_name.get(), "bom": product.sheet_name}
         count = production_quantity(self.quantity_text.get())
+        if self.cache_selection is not None:
+            self._check_cached(selected, count)
+            return
         def action():
             outcomes = {role: self._read(role, path) for role, path in paths.items()}
             stock, bom = outcomes["stock"][0], outcomes["bom"][0]
@@ -952,7 +1100,9 @@ class CheckerApp:
         self.summary_counts["total"].set(str(len(result.rows)))
         for category in (SHORTAGE, EXCEPTION, ENOUGH):
             self.summary_counts[category].set(str(result.category_count(category)))
-        if bound is not None and not bound.current:
+        if isinstance(bound, cached.CacheBinding):
+            self.summary.set(cached.LABEL + "\n" + self.summary.get())
+        elif bound is not None and not bound.current:
             self.summary.set(f"{binding.OUTDATED}\n" + self.summary.get())
         self._detail_text("")
         self.hide_details()
@@ -1015,6 +1165,8 @@ class CheckerApp:
             return
         result, bound, job = self.result, self.result_binding, self.job
         name = default_filename(self.result.product.display_name, self.result.production_count, datetime.now())
+        if isinstance(bound, cached.CacheBinding):
+            name = 'UNVERIFIED_' + name
         # No overwrite prompt: an existing file is never replaced, a numbered name is used instead.
         path = filedialog.asksaveasfilename(parent=self.root, title="导出为新的 Excel 报告", defaultextension=".xlsx",
                                            filetypes=[("Excel (.xlsx)", "*.xlsx")], initialfile=name, confirmoverwrite=False)
@@ -1025,6 +1177,10 @@ class CheckerApp:
             self.write_export(path)
 
     def _refuse_outdated_export(self, detail=""):
+        if isinstance(self.result_binding, cached.CacheBinding):
+            messagebox.showerror(binding.OUTDATED, "历史缓存结果无法复核。请重新选择缓存并 CHECK，"
+                                 "或 Refresh Excel 重新读取源文件。\n" + detail, parent=self.root)
+            return
         messagebox.showerror(binding.OUTDATED,
                              "此结果不能确认属于当前的本机 Storage / BOM 文件版本（源文件已变化或无法复核），不能导出为有效报告。"
                              "请重新 CHECK。" + ("\n" + detail if detail else ""), parent=self.root)
@@ -1045,6 +1201,15 @@ class CheckerApp:
         self._refuse_outdated_export(detail)
 
     def _verify_export_sources(self):
+        if isinstance(self.result_binding, cached.CacheBinding):
+            try:
+                if not self.result_exportable:
+                    raise cached.CacheError('Cached result is outdated or its selected sources changed.')
+                cached.verify(self.result_binding.snapshot)
+            except cached.CacheError as exc:
+                self._cache_export_failed(exc)
+                return False
+            return True
         if not self.result_current:
             self._refuse_outdated_export()
             return False
@@ -1055,16 +1220,41 @@ class CheckerApp:
             return False
         return True
 
+    def _cache_export_failed(self, exc):
+        self.cache_authorized = False
+        self.mode_label.configure(text=cached.LABEL + " · Reselect required", foreground="#b00020")
+        self.result_binding = replace(self.result_binding, valid=False)
+        self._show_result_state()
+        self.export_feedback.grid_remove()
+        if isinstance(exc, cached.CacheReadError):
+            self.inventory_roles = {}
+            self.inventory_read_error = str(exc)
+            self._render_inventory()
+        if not self.summary.get().startswith(binding.OUTDATED):
+            self.summary.set(binding.OUTDATED + '\n' + self.summary.get())
+        detail = '\n'.join(x for x in (str(exc), getattr(exc, 'cleanup_warning', '')) if x)
+        self.status.set(binding.OUTDATED + ' · ' + cached.LABEL + ' · Cloud Not Verified')
+        self._refuse_outdated_export(detail)
+
     def write_export(self, path):
         """Save the current result as a new .xlsx. Returns the path written, or None if refused or failed."""
         if self.busy or self.result is None or self.stock_book is None or self.bom_book is None:
             return None
-        if not self.result_current:
-            self._refuse_outdated_export()
+        if not self.result_exportable:
+            if isinstance(self.result_binding, cached.CacheBinding):
+                self._cache_export_failed(cached.CacheError('Cached result or selected sources are outdated.'))
+            else:
+                self._refuse_outdated_export()
             return None
         try:
-            written = save_verified_report(path, self.result, self.stock_book, self.bom_book,
-                                           self.result_binding, self._export_sources())
+            if isinstance(self.result_binding, cached.CacheBinding):
+                written = cached.save(path, self.result, self.stock_book, self.bom_book, self.result_binding)
+            else:
+                written = save_verified_report(path, self.result, self.stock_book, self.bom_book,
+                                               self.result_binding, self._export_sources())
+        except cached.CacheError as exc:
+            self._cache_export_failed(exc)
+            return None
         except binding.ExportVerificationError as exc:
             self._export_verification_failed(exc)
             return None
@@ -1078,7 +1268,8 @@ class CheckerApp:
         self.hide_details()
         self.export_feedback.grid()
         self._resize()
-        self.status.set("Report exported successfully.")
+        self.status.set((cached.LABEL + " report exported · Cloud Not Verified")
+                        if isinstance(self.result_binding, cached.CacheBinding) else "Report exported successfully.")
         return written
 
     def close(self):

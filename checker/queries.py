@@ -267,6 +267,8 @@ def observed_change_summary(conn, days: int, now: datetime | None = None, materi
     start = end - timedelta(days=days)
     in_window = snapshots(conn, start, end)
     first = conn.execute("SELECT min(observed_at) FROM inventory_snapshots").fetchone()[0]
+    retained = conn.execute("SELECT value FROM schema_info WHERE key='history_retained_from'").fetchone()
+    retained_from = retained[0] if retained else None
     materials = {}
     for change in observed_changes(conn, start, end, material_id):
         entry = materials.setdefault((change["sheet_name"], change["material_key"]), dict(
@@ -283,15 +285,17 @@ def observed_change_summary(conn, days: int, now: datetime | None = None, materi
         if change["same_source_path"] == 0:
             entry["cross_source_changes"] += 1
     return dict(window_days=days, window_start=stamp(start), window_end=stamp(end), snapshot_count=len(in_window),
-                first_snapshot_at=first, covers_full_window=bool(first and first <= stamp(start)),
+                first_snapshot_at=first, retained_from=retained_from,
+                covers_full_window=bool(first and first <= stamp(start) and
+                                       (retained_from is None or stamp(start) >= retained_from)),
                 materials=list(materials.values()), caveat=OBSERVED_CHANGE_CAVEAT)
 
 
 # ---------------------------------------------------------------------- reconstruction (parity with the Excel reader)
 def load_workbook_data(conn, role: str, version_id: int | None = None) -> WorkbookData:
-    """Rebuild the reader's WorkbookData from the database, value for value, for parity checks.
+    """Rebuild WorkbookData for parity checks and explicit M3.2A historical-cache calculations.
 
-    The BOM Checker does not use this: it keeps reading the Excel files through checker.reader."""
+    The default CHECK still reads Excel. Cache callers must hold a read transaction across both roles."""
     version = (conn.execute("SELECT * FROM source_versions WHERE id = ?", (version_id,)).fetchone() if version_id
                else current_version(conn, role))
     if version is None or version["role"] != role:
@@ -319,5 +323,8 @@ def load_workbook_data(conn, role: str, version_id: int | None = None) -> Workbo
             products.append(Product(path, product["sheet_name"], product["product_id"], product["header_row"],
                                     tuple(material(r, product["sheet_name"], ("column_j", "column_k")) for r in rows)))
     imported = parse_stamp(version["imported_at"])
+    sheets = stock_sheets if role == 'stock' else products
+    if len(sheets) != version['sheet_count'] or sum(len(s.materials) for s in sheets) != version['record_count']:
+        raise LookupError('Workbook payload is no longer retained or is incomplete; no data was reconstructed.')
     return WorkbookData(path, (path, version["size_bytes"], version["mtime_ns"]), tuple(products), tuple(stock_sheets),
                         tuple(json.loads(version["notes"])), imported.replace(tzinfo=timezone.utc).timestamp())

@@ -70,7 +70,41 @@ The app keeps a local SQLite copy of the Storage and BOM data in `%LOCALAPPDATA%
 - **If the status cannot be read from the database**, the panel and status bar show `Status Unknown — Database Read Failed`. No earlier status or time is kept on screen, and no stored data is deleted.
 - **Each new Storage version is stored as a snapshot.** Differences between versions are *observed changes*, not confirmed consumption.
 
-The BOM Checker still calculates from the Excel files with the unchanged engine. `--data-dir DIR` uses a different data folder (for testing).
+By default the BOM Checker calculates from Excel with the unchanged engine. `--data-dir DIR` uses a different data folder (for testing).
+
+## Historical cached calculations (M3.2A, in development)
+
+When Excel is unavailable, CHECK fails visibly; it never silently falls back to SQLite. To run a historical estimate:
+
+1. Click **Use Cached Data…** in the top file area.
+2. Review both Storage and BOM source paths, database version IDs, source modification times, import times and historical verification times (UTC). The two files synchronise independently and may have different dates. Confirm explicitly; the default answer is No.
+3. Choose an existing cached product and Storage sheet, enter a positive production quantity and CHECK.
+4. The result remains **CACHED DATA / UNVERIFIED**, with **Cloud Not Verified** visible. This never becomes Local Sources Verified, even if the files happen to be available.
+5. Export writes a separate **UNVERIFIED_** report. Both sheets show the warning, cache versions and import dates; the warning repeats on printed pages. Calculation/classification rules and material tables are unchanged.
+
+Both roles need a successful cached version. Missing, unsupported or unreadable databases cannot be used. Selection, calculation and export check the database versions; if they change, the result cannot be exported and you must select/confirm the cache again. No cached calculation writes the database or opens the source Excel files. Changing product, quantity or Storage sheet clears the old result.
+
+**Refresh Excel / Reload Files** leaves cache mode and reads the real files again. A failed refresh never re-enables cache automatically. Browsing a new file also leaves cache mode and clears the cached selections. The opt-in lasts only in the current session; restarting always begins with the normal Excel workflow. Cached calculations do not clear any existing synchronisation failure or claim that inventory is current.
+
+Nothing automatically deletes versions, snapshots or logs. The separate manual maintenance workflow below implements M3.2B. Export still performs synchronous verification; slow disk/cloud I/O can delay the UI.
+
+## Local history maintenance (M3.2B, in development)
+
+Click **Local History…** in the top file area to prepare a read-only cleanup preview. It shows the local database path, cutoff times and exact deletion counts. Choosing **No** leaves the database untouched. Choosing **Yes** creates a recovery backup and applies the matching preview in one transaction; calculation results are cleared and need CHECK again. Maintenance runs on a worker and disables overlapping actions.
+
+| Active database records | Retention |
+|---|---|
+| Inventory snapshots / old Storage payloads | 12 calendar months, by UTC observation/import time |
+| Routine sync logs (`IMPORTED`, `UNCHANGED`) | 90 days, by UTC finish time |
+| Failure logs (`FAILED`, `UNAVAILABLE`) | 180 days, by UTC finish time |
+
+Records exactly at the cutoff are kept. Latest/current snapshots, the last snapshot before the retention window and the predecessor payloads required to explain retained differences are protected, even if older. Current Storage/BOM payloads and each role's latest attempt/success records are protected; deleting logs cannot turn an old failure into apparent success or remove the cache's successful provenance. Lightweight source-version headers, BOM history and the material registry are retained to preserve references. An expired Storage payload cannot be reconstructed as an empty workbook. Trend queries explicitly report the retained history boundary and do not claim complete coverage before it.
+
+The database is checked again after confirmation and under the write lock. If anything changed since preview, maintenance is refused and a new preview is required. Backup failure or a deletion error prevents partial cleanup; errors include the backup path when one exists. The source Excel files and Drive settings are never touched.
+
+Recovery backups live in the database folder's `backups` subfolder. A successful `.sqlite3` backup is verified against the preview's logical database snapshot before deletion. **`.partial` files are failed/incomplete backup attempts and must not be used for recovery.** Recovery is manual, with the application closed; the tool does not overwrite a live database automatically.
+
+**Backups contain historical records and are not automatically deleted.** This retention policy limits active SQLite history, not all copies or secure data erasure. A backup-retention policy needs separate approval. Deletion frees SQLite pages for reuse but does not promise a smaller database file or net disk-space savings; no automatic VACUUM is performed. Store the database/backups in the default local user data folder, not a cloud-synchronised directory or unvalidated network share.
 
 ## Safety
 

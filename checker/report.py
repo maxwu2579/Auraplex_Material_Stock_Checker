@@ -186,14 +186,26 @@ def save_verified_report(path, result, stock_book, bom_book, source_binding, sou
                                            verified.checked_at, checked.attempts)
             raise binding.ExportVerificationError(failed, f"{binding.ROLE_NAMES[role]} report data differs from CHECK.")
     sources = (stock_book.path, bom_book.path)
+    def build():
+        book = build_report(result, stock_book, bom_book, datetime.now())
+        try:
+            _export_provenance(book, checked, verified)
+            return book
+        except BaseException:
+            book.close()
+            raise
+    return _stage_report(path, sources, build, lambda: binding.verify_export(checked, paths))
+
+
+def _stage_report(path, sources, build, validate):
+    """Shared no-overwrite publication; caller supplies its own explicit verification contract."""
     target = safe_target(path, sources)
     descriptor, temporary = tempfile.mkstemp(prefix=".mrc-export-", suffix=".xlsx", dir=target.parent)
     os.close(descriptor)
     failure = None
     try:
-        book = build_report(result, stock_book, bom_book, datetime.now())
+        book = build()
         try:
-            _export_provenance(book, checked, verified)
             book.save(temporary)
         finally:
             book.close()
@@ -201,7 +213,7 @@ def save_verified_report(path, result, stock_book, bom_book, source_binding, sou
         # completed export verification, not a future timestamp that was not known when the workbook was saved.
         for _ in range(10):
             target = safe_target(path, sources)
-            binding.verify_export(checked, paths)
+            validate()
             try:
                 if os.name == "nt":
                     os.rename(temporary, target)  # Windows refuses an existing destination atomically
