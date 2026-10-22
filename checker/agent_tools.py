@@ -186,7 +186,7 @@ class InventoryTools:
                 if name != 'data_status':
                     self._allowed(generation, basis)
                 metadata = self._metadata(conn)
-                data = self._execute(conn, name, arguments, cancel)
+                data = self._execute(conn, name, arguments, cancel, deadline)
             if self.basis() != basis:
                 raise ToolError('STALE_DATA', 'Database changed during query; no result published.')
             if name != 'data_status':
@@ -242,32 +242,51 @@ class InventoryTools:
             raise ToolError('LIMIT_EXCEEDED', 'Workbook exceeds the M4C query row limit.')
         return queries.load_workbook_data(conn, role)
 
-    def _execute(self, conn, name, args, cancel):
+    def _execute(self, conn, name, args, cancel, deadline):
         if name == 'data_status':
             return {'recorded_states': queries.freshness(conn), 'session_source_verification': 'NOT_PERFORMED',
                     'note': 'Recorded success is historical; unrecorded failures and live Excel state are unknown.'}
         if name in ('material_history', 'material_analysis'):
             key = normalize_code(args['material_id'])
-            broken = conn.execute(
-                'SELECT count(*) FROM stock_records r LEFT JOIN stock_sheets s ON s.id=r.stock_sheet_id'
-                ' WHERE s.id IS NULL OR s.source_version_id!=r.source_version_id').fetchone()[0]
-            if broken:
-                raise history.HistoryReadError('Historical row ownership is inconsistent.')
             # M4A has no overall snapshot cap: impose one at the new tool boundary.
             now = utc_now()
-            start = stamp(now - timedelta(days=args['days']))
-            span = conn.execute('SELECT count(*), coalesce(sum(record_count),0) FROM inventory_snapshots'
-                                ' WHERE observed_at>=?', (start,)).fetchone()
-            reference = conn.execute('SELECT record_count FROM inventory_snapshots WHERE observed_at<?'
+            start, end = stamp(now - timedelta(days=args['days'])), stamp(now)
+            window = conn.execute('SELECT source_version_id, record_count FROM inventory_snapshots'
+                                  ' WHERE observed_at>=? AND observed_at<=? LIMIT 401', (start, end)).fetchall()
+            reference = conn.execute('SELECT source_version_id, record_count FROM inventory_snapshots WHERE observed_at<?'
                                      ' ORDER BY observed_at DESC, id DESC LIMIT 1', (start,)).fetchone()
-            if span[0] > 400 or span[1] + (reference[0] if reference else 0) > 50_000:
+            selected = window + ([reference] if reference is not None else [])
+            if len(window) > 400 or sum(s['record_count'] for s in selected) > 50_000:
                 raise ToolError('LIMIT_EXCEEDED', 'Too many historical observations; narrow the range.')
+            versions = sorted({s['source_version_id'] for s in selected})
+            if versions:
+                slots = ','.join('?' for _ in versions)
+                # Check both directions using per-version indexes: a foreign row attached to a selected
+                # Sheet is inconsistent even when that row's declared version is outside the window.
+                broken = conn.execute(
+                    'SELECT EXISTS(SELECT 1 FROM stock_records r LEFT JOIN stock_sheets s ON s.id=r.stock_sheet_id'
+                    f' WHERE r.source_version_id IN ({slots})'
+                    ' AND (s.id IS NULL OR s.source_version_id!=r.source_version_id))'
+                    ' OR EXISTS(SELECT 1 FROM stock_sheets s JOIN stock_records r ON r.stock_sheet_id=s.id'
+                    f' WHERE s.source_version_id IN ({slots}) AND r.source_version_id!=s.source_version_id)',
+                    versions + versions).fetchone()[0]
+                if broken:
+                    raise history.HistoryReadError('Historical row ownership is inconsistent.')
             # Reuse this read-only snapshot and its SQLite timeout/cancellation handler.
             if name == 'material_history':
                 return history.material_history(self.database, key, args['days'], args.get('sheet'),
                                                 now=now, max_rows=200, max_changes=200, connection=conn)
-            result = analytics.analyze(self.database, args['days'], args.get('sheet'), key,
-                                       now=now, cancel=cancel, max_rows=50_000, max_groups=200, connection=conn)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ToolError('LIMIT_EXCEEDED', 'Query time limit reached; no result published.')
+            try:
+                result = analytics.analyze(self.database, args['days'], args.get('sheet'), key,
+                                           now=now, cancel=cancel, max_rows=50_000, max_groups=200,
+                                           budget_seconds=remaining, connection=conn)
+            finally:
+                # analyze installs/removes its own handler; restore the caller's original deadline.
+                conn.set_progress_handler(lambda: int(time.monotonic() > deadline or
+                    (cancel is not None and cancel.is_set())), 1000)
             return {**plain(result), 'materials': [plain(m) for m in result.materials if m.material_key == key]}
         if name == 'get_stock_alerts':
             state = alerts.state_in(conn, include_other_sources=False, limit=200)

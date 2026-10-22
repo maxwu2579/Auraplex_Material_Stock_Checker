@@ -252,8 +252,8 @@ class ToolsTests(Base):
             conn.execute('PRAGMA journal_mode=WAL')
         self.permit()
         original = self.tools._execute
-        def publish(conn, name, args, cancel):
-            old = original(conn, name, args, cancel)
+        def publish(conn, name, args, cancel, deadline):
+            old = original(conn, name, args, cancel, deadline)
             self.assertEqual(old['rows'][0]['quantity'], 100)
             self.write_stock([('A', 0)])
             self.assertTrue(self.sync('stock').ok)
@@ -285,6 +285,96 @@ class ToolsTests(Base):
                 result = self.call('material_analysis', {'material_id': 'A', 'days': 30})
             self.assertEqual(result['error']['code'], expected)
             self.assertEqual(self.tools.generation, generation)
+
+    def test_analysis_receives_only_remaining_tool_budget_and_cancel(self):
+        self.permit()
+        ticks = [0.0]
+        original = self.tools._metadata
+        cancel = threading.Event()
+        def metadata(conn):
+            value = original(conn)
+            ticks[0] = .75  # metadata/prechecks consumed three quarters of this call's budget
+            return value
+        with patch('checker.agent_tools.time.monotonic', side_effect=lambda: ticks[0]), \
+                patch.object(self.tools, '_metadata', side_effect=metadata), \
+                patch('checker.agent_tools.analytics.analyze', wraps=analytics.analyze) as analyze:
+            result = self.tools.call('material_analysis', {'material_id': 'A', 'days': 30},
+                                     cancel=cancel, budget_seconds=1)
+        self.assertTrue(result['ok'], result)
+        self.assertEqual(analyze.call_args.kwargs['budget_seconds'], .25)
+        self.assertIs(analyze.call_args.kwargs['cancel'], cancel)
+
+    def test_analysis_uses_original_deadline_instead_of_fresh_five_seconds(self):
+        self.permit(); generation = self.tools.generation
+        ticks = [0.0]
+        original = self.tools._metadata
+        def metadata(conn):
+            value = original(conn)
+            ticks[0] = .75
+            return value
+        def elapsed(_):
+            ticks[0] = 1.01
+        with patch('checker.agent_tools.time.monotonic', side_effect=lambda: ticks[0]), \
+                patch.object(self.tools, '_metadata', side_effect=metadata), \
+                patch('checker.analytics._checkpoint', side_effect=elapsed):
+            result = self.tools.call('material_analysis', {'material_id': 'A', 'days': 30}, budget_seconds=1)
+        self.assertEqual(result['error']['code'], 'LIMIT_EXCEEDED')
+        self.assertIsNone(result['data'])
+        self.assertEqual(self.tools.generation, generation)
+
+    def _window_versions(self):
+        for qty in (90, 80):
+            self.write_stock([('A', qty)]); self.sync('stock')
+        with closing(self.inv.connect()) as conn, conn:
+            versions = [r[0] for r in conn.execute(
+                'SELECT source_version_id FROM inventory_snapshots ORDER BY id')]
+            for version, observed in zip(versions, ('2026-01-01', '2026-09-01', '2026-10-21')):
+                conn.execute('UPDATE inventory_snapshots SET observed_at=? WHERE source_version_id=?',
+                             (observed + ' 08:00:00.000000', version))
+        return versions
+
+    def test_unselected_old_payload_does_not_block_window_and_reference(self):
+        old, reference, current = self._window_versions()
+        conn = self.inv.connect()
+        try:
+            conn.execute('PRAGMA foreign_keys=OFF')
+            conn.execute('UPDATE stock_records SET stock_sheet_id=-1 WHERE source_version_id=?', (old,))
+            conn.commit()
+        finally:
+            conn.close()
+        self.permit()
+        with patch('checker.agent_tools.utc_now', return_value=datetime(2026, 10, 22, tzinfo=timezone.utc)):
+            for name in ('material_history', 'material_analysis'):
+                result = self.call(name, {'material_id': 'A', 'days': 30})
+                self.assertTrue(result['ok'], result)
+            rows = self.call('material_history', {'material_id': 'A', 'days': 30})['data']['rows']
+        self.assertEqual({row['version_id'] for row in rows}, {reference, current})
+
+    def test_reference_and_window_orphan_rows_still_refused(self):
+        _, reference, current = self._window_versions()
+        for version in (reference, current):
+            with closing(self.inv.connect()) as conn, conn:
+                sheet_id = conn.execute('SELECT id FROM stock_sheets WHERE source_version_id=?', (version,)).fetchone()[0]
+                conn.execute('PRAGMA foreign_keys=OFF')
+                conn.execute('UPDATE stock_records SET stock_sheet_id=-1 WHERE source_version_id=?', (version,))
+            for name in ('material_history', 'material_analysis'):
+                self.permit()
+                with patch('checker.agent_tools.utc_now', return_value=datetime(2026, 10, 22, tzinfo=timezone.utc)):
+                    result = self.call(name, {'material_id': 'A', 'days': 30})
+                self.assertEqual(result['error']['code'], 'DATABASE_READ_FAILED', result)
+            with closing(self.inv.connect()) as conn, conn:
+                conn.execute('UPDATE stock_records SET stock_sheet_id=? WHERE source_version_id=?', (sheet_id, version))
+
+    def test_foreign_old_row_attached_to_selected_sheet_is_refused(self):
+        old, _, current = self._window_versions()
+        with closing(self.inv.connect()) as conn, conn:
+            conn.execute('UPDATE stock_records SET stock_sheet_id=(SELECT id FROM stock_sheets'
+                         ' WHERE source_version_id=?) WHERE source_version_id=?', (current, old))
+        for name in ('material_history', 'material_analysis'):
+            self.permit()
+            with patch('checker.agent_tools.utc_now', return_value=datetime(2026, 10, 22, tzinfo=timezone.utc)):
+                result = self.call(name, {'material_id': 'A', 'days': 30})
+            self.assertEqual(result['error']['code'], 'DATABASE_READ_FAILED', result)
 
 
 class AgentFlowTests(Base):
