@@ -1,16 +1,13 @@
 """Windows entry point. Source workbooks are never saved."""
-import tkinter as tk
 import argparse
 import json
 import sqlite3
 import sys
 from pathlib import Path
 
-from checker import ui
 from checker.appdata import Settings, default_data_dir
 from checker.inventory_db import DatabaseError
 from checker.sync import LOCAL_VERIFIED, InventorySync
-from checker.ui import CheckerApp
 
 VERSION = "1.1.0.dev0"
 
@@ -30,6 +27,7 @@ def self_test(root, app, storage, bom, output_dir):
     then exit.
 
     Writes self_test.json to output_dir because a windowed executable has no console. Not used in normal operation."""
+    from checker import ui
     output = Path(output_dir)
     errors, report = [], {"version": VERSION, "frozen": bool(getattr(sys, "frozen", False)), "executable": sys.executable,
                           "ui_module": ui.__file__, "passed": False}
@@ -118,7 +116,26 @@ def main():
     parser.add_argument("--data-dir", help="Folder for the local inventory database and remembered paths "
                                            r"(default %%LOCALAPPDATA%%\Auraplex\MaterialStockChecker; "
                                            "self-test default OUTPUT_DIR\\appdata)")
+    parser.add_argument("--daily-run", metavar="OUTPUT_DIR",
+                        help="Unattended daily run: verify remembered Excel files, evaluate and save HTML/JSON; no UI")
+    parser.add_argument("--daily-attempts", type=int, choices=(1, 2, 3), default=1,
+                        help="Bounded unattended attempts (default 1; schedule drafts explicitly request 3)")
+    parser.add_argument("--daily-retry-delay", type=float, default=5,
+                        help="Seconds between unattended attempts, 0–30 (default 5)")
     args = parser.parse_args()
+    if args.daily_run is not None:
+        if args.smoke_test or args.self_test:
+            parser.error('--daily-run cannot be combined with GUI smoke/self-test')
+        if not args.daily_run.strip():
+            parser.error('--daily-run requires a non-empty output folder')
+        from checker.jobs import run
+        outcome = run(args.data_dir or default_data_dir(), args.daily_run,
+                      attempts=args.daily_attempts, retry_delay=args.daily_retry_delay)
+        if sys.stdout is not None:
+            print(json.dumps(outcome.__dict__, ensure_ascii=True))  # machine-readable on Windows console code pages
+        return outcome.code
+    import tkinter as tk
+    from checker.ui import CheckerApp
     root = tk.Tk()
     if args.smoke_test:
         root.withdraw()
@@ -137,4 +154,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -185,6 +185,28 @@ Click **Daily Summary…** (beside the *Stock Alerts* line, top right) to open a
 
 Generation and saving run in the background, one at a time with at most one waiting request; the newest request always wins, an older result never replaces it, a failed generation clears the preview, and closing the window discards pending results. A database read failure is handled like other alert reads: this session's verification is discarded until Refresh Excel. Preview lists show 200 rows each; the saved files hold up to 5,000 alerts and 2,000 observed changes, with totals always counted.
 
+## Unattended daily run and schedule draft (M3.2E E1, in development)
+
+Open **Daily Summary… → Schedule draft…** to choose an existing output folder and local daily time. The default-No confirmation explains the constraints, then exports a new Task Scheduler XML file. **This does not register, enable or change a Windows task.** Existing XML files are not overwritten. Actual task activation is a separate user decision and acceptance step.
+
+The draft uses the current logged-in Windows account (`InteractiveToken`, least privilege), no saved password, one daily trigger, no parallel instances, and at most three application-managed attempts 30 seconds apart. Each attempt rechecks both Excel sources; no native RestartOnFailure loop is configured. It requests a delayed run if the scheduled time was missed. A delayed run verifies/generates the current day; it does not recreate the stock state of every missed date. The computer must be available, the user logged in, and the Drive-mounted source files accessible. The draft does not wake the computer and waits on battery power. No guarantee of exact-time delivery is made. Regenerate/review the draft after moving the portable folder or changing executable/data/output paths.
+
+For development or a separately approved scheduled action:
+
+```powershell
+.\.venv\Scripts\python.exe app.py --daily-run 'C:\Reports\Auraplex' --data-dir 'C:\LocalData\Auraplex'
+# Optional CLI retries; default is one attempt; generated schedule drafts explicitly request 3 attempts / 30 seconds:
+.\.venv\Scripts\python.exe app.py --daily-run 'C:\Reports\Auraplex' --daily-attempts 2 --daily-retry-delay 5
+```
+
+Use the real configured data folder, normally `%LOCALAPPDATA%\Auraplex\MaterialStockChecker`; the example paths are placeholders, not defaults or a recommendation to relocate existing data. Both folders must exist. First open the GUI, select/load both Excel sources and explicitly upgrade the database to schema 3 if required. Background runs never create a missing database or perform a schema upgrade. The M3.2E packaged CLI passed focused temporary EXE checks; clean-machine and other-PC acceptance remains pending.
+
+Each process acquires a per-data-folder OS lock, checks both remembered Excel sources itself, evaluates alerts with a new per-run authorization, then calls the existing guarded daily generator/saver. It creates no GUI or modal dialogs. Source failure/unverified evaluation means **no cached report**; retries are bounded to 1–3 attempts with a 0–30-second delay. Cloud Not Verified remains in reports. The normal rollback-journal saving requirement still applies; WAL is not changed automatically.
+
+Exit codes: `0` saved, `2` configuration/upgrade/journal-mode requirement, `3` sources not verified, `4` database/evaluation error, `5` generation/save/log error, `6` another run already owns the folder. `daily-runs.json` records UTC completion, code/reason, attempts/errors and any published report path; this feature keeps the latest 200 receipts plus the last success. It never prunes the inventory database. A corrupt receipt file is preserved and reported; if a report was already saved but logging fails, the failure outcome retains that report's path. `daily-run.lock` is an OS lock sentinel; its presence alone does not mean a run is active. A duplicate process returns code 6 without modifying the active run's log.
+
+Task Scheduler behavior references: [StartWhenAvailable](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-startwhenavailable-settingstype-element), [MultipleInstancesPolicy](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-multipleinstancespolicy-settingstype-element). Temporary actual timed recovery on attempt 2 and exhaustion after attempt 3 passed in source and packaged modes. Native automatic restart was not observed; its cause is retained for later CC investigation. See `M3_2E_SCHEDULER_VALIDATION.md`. Missed-run, clean-machine and other-PC acceptance remain unexecuted. No Email, AI, automatic task registration or company-PC deployment is included in E1.
+
 ## Safety
 
 The program reads the selected Storage and BOM workbooks and generates a separate report. It does not modify the source workbooks.

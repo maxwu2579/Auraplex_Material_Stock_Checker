@@ -96,6 +96,8 @@ class DailySummaryWindow:
         footer = ttk.Frame(outer)
         footer.grid(row=5, sticky="ew", pady=(6, 0))
         ttk.Button(footer, text="Close", command=self.close, padding=(10, 1)).pack(side="right")
+        ttk.Button(footer, text="Schedule draft…", command=self.schedule_draft, padding=(8, 1)).pack(side="right",
+                                                                                                    padx=(0, 8))
         self.open_button = ttk.Button(footer, text="Open saved report", command=self.open_saved, padding=(10, 1),
                                       state="disabled")
         self.open_button.pack(side="right", padx=(0, 8))
@@ -176,6 +178,50 @@ class DailySummaryWindow:
         self._refresh_state()
 
     # ------------------------------------------------------------------ save
+    def schedule_draft(self):
+        """Generate a reviewable XML file only. Never imports/enables tasks or asks for Windows credentials."""
+        from tkinter import simpledialog
+        from .scheduling import task_xml
+        if self.closed or self.runner.busy:
+            return
+        output = filedialog.askdirectory(parent=self.top, title="Choose the scheduled daily-report folder",
+                                         mustexist=True)
+        if not output or self.closed:
+            return
+        at = simpledialog.askstring('Daily schedule draft', 'Local daily time (HH:MM, e.g. 18:00):',
+                                   initialvalue='18:00', parent=self.top)
+        if at is None or self.closed:
+            return
+        try:
+            payload = task_xml(Path(self.database).parent, output, at)
+        except (ValueError, OSError) as exc:
+            messagebox.showerror('Schedule draft', str(exc), parent=self.top)
+            return
+        if not messagebox.askyesno('Save schedule draft only?',
+            f'Daily at {at} (local time), output:\n{output}\n\n'
+            'This exports XML only; no Windows task will be registered or enabled.\n'
+            'The current user must be logged in, with both source files available.\n'
+            'Each run tries at most 3 times, 30 seconds apart; no Windows restart loop.\n'
+            'No password is stored. Missed schedules request one delayed run of the current day; '
+            'historical daily stock states are not reconstructed. On battery power the task waits.\n'
+            'Requires the explicitly upgraded database and previously selected Storage/BOM paths.\n\n'
+            'Save the draft for review?', parent=self.top, default='no') or self.closed:
+            return
+        path = filedialog.asksaveasfilename(parent=self.top, title='Save new Task Scheduler XML (draft only)',
+                                          initialfile='Auraplex_Daily_Summary.xml', defaultextension='.xml',
+                                          filetypes=[('Task Scheduler XML', '*.xml')], confirmoverwrite=False)
+        if not path or self.closed:
+            return
+        try:
+            with open(path, 'xb') as stream:
+                stream.write(payload)
+        except OSError as exc:
+            messagebox.showerror('Schedule draft not saved', str(exc), parent=self.top)
+            return
+        messagebox.showinfo('Draft saved — no task installed', str(path) +
+                            '\nReview/import with Windows Task Scheduler only when ready. '
+                            'No task has been created or enabled.', parent=self.top)
+
     def can_save(self) -> bool:
         return (self.summary is not None and self.stale is None and self.saving is None and not self.runner.busy
                 and self.selected_date() is not None and self.selected_date().isoformat() == self.summary.report_date)
