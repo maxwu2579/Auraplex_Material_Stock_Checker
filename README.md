@@ -106,6 +106,67 @@ Recovery backups live in the database folder's `backups` subfolder. A successful
 
 **Backups contain historical records and are not automatically deleted.** This retention policy limits active SQLite history, not all copies or secure data erasure. A backup-retention policy needs separate approval. Deletion frees SQLite pages for reuse but does not promise a smaller database file or net disk-space savings; no automatic VACUUM is performed. Store the database/backups in the default local user data folder, not a cloud-synchronised directory or unvalidated network share.
 
+## Stock alerts (M3.2C, in development)
+
+Stock alerts are evaluated from the **synchronised** data, not by parsing Excel again. They run automatically in the background after this program has verified both the Storage and the BOM file in the current session (start-up, Refresh Excel, CHECK). The line **Stock Alerts: N active** under the top buttons opens the **Stock Alerts** window. Its banner always says *From synchronised Excel data · Cloud Not Verified · Thresholds and units pending business confirmation*. The CHECK area, M2 rules (including ASSUMED 0) and export are unchanged.
+
+**Minimum-stock column.** On the Storage header row, exactly the headers `MIN QTY` and `MIIN QTY` are recognised (`MIIN QTY` is the confirmed spelling in the AURA Storage workbook; Excel is never changed). There is no fuzzy matching, and the column must lie within A–AD. The original header text, raw value, Sheet and row are kept. If several candidate columns exist, none is chosen: a `THRESHOLD_COLUMN_AMBIGUOUS` data issue asks for confirmation. The business meaning of the threshold, and of its units, is still to be confirmed. Storage has no unit column, so LIVE STOCK and the threshold **of the same row** are compared as a trial only.
+
+| Alert | When | Never means |
+|---|---|---|
+| `OUT_OF_STOCK` | Unique ID, LIVE STOCK is the valid number 0 (whatever the threshold) | that a production order is short |
+| `LOW_STOCK` | Unique ID, valid LIVE STOCK < valid threshold. Equal is not low; threshold 0 never makes LOW. Shows the **threshold shortfall** (threshold − LIVE STOCK). Trial rule, pending business confirmation | a production requirement |
+| `BOM_MATERIAL_NOT_IN_STOCK_MASTER` | A valid BOM ID with no exact match in that Storage Sheet. Every product, BOM Sheet, row and raw QTY is listed; quantities are never added | stock 0 or a confirmed shortage |
+| `DATA_ISSUE` | Blank or invalid LIVE STOCK, invalid threshold, duplicate Storage ID (rows kept separate), unusable Storage ID, ambiguous threshold column | a converted or merged value |
+| `THRESHOLD_NOT_CONFIGURED` | Unique ID with a blank threshold. Other alerts of the same material are still shown | threshold 0 |
+
+A threshold of `0` stays the number 0 and is not interpreted ("no stock needed" / "alert off" are not assumed). Matching uses the checker's exact rule (letter case and surrounding spaces ignored; internal spaces, hyphens, revisions and suffixes kept). Each Storage Sheet is evaluated separately. The window summary counts **distinct missing IDs**, **affected BOM rows** and **affected products** separately.
+
+**One alert per source file.** An alert's identity is its type, issue, **Storage file** (plus the **BOM file** for BOM-coverage alerts), Storage Sheet, and Material ID or row. New versions of the same file de-duplicate: first-seen stays, last-seen moves on. The same Sheet and ID in another file is a different alert. An evaluation can only resolve alerts of its own files. Alerts of a file that is no longer selected stay **active, from another source, not re-checked**: they are hidden by default (*Show other source files*) and never shown as recovered. Switching back to that file continues them.
+
+**When alerts are current.** An evaluation adds, updates or resolves alerts only if, at the moment it writes:
+- the newest synchronisation record of both files is a success for the current versions;
+- this program itself verified exactly those versions and paths in this session;
+- nothing happened since that could change this, such as another selection, a sync, a failure (including one that could not be written to the database) or a database read failure.
+
+Otherwise the attempt is recorded as UNVERIFIED (or FAILED) and no alert changes. The last check is made at the moment of COMMIT: a verification withdrawn at any point before it rolls the whole publication back. A database read failure (including one in the Stock Alerts window) discards this session's verification of both files, so *Re-evaluate* cannot make alerts current again; Refresh Excel (a new successful check of both files) is needed. The line then also says *database read failed*. Until a current, verified evaluation completes, the line says **not re-checked**, and the window starts with **NOT RE-CHECKED IN THIS SESSION** and the reason. This covers start-up, any newer sync or failure, and a late result from an older request. One evaluation runs at a time, with at most one waiting.
+
+**The Stock Alerts window** has two tabs, sharing a **Storage Sheet** filter and a **Material ID contains** filter:
+- **Alerts** (type filter, *Show resolved*, *Show other source files*). Each alert shows its raw values, threshold column and header, threshold shortfall, Storage file and version (and BOM file for coverage alerts), and first/last-seen times. The details line adds Rack/Level, full paths and every BOM occurrence. A basis panel names the current files, the last verified evaluation of exactly those files, and the per-Sheet counts.
+- **Observed Changes** (change-type filter, 30 / 60 / 90 days). The differences between synchronised versions of the **current Storage file**, read from the stored snapshots (no Excel parsing). They follow the M4A rules: a difference only between single valid records of the same file, and *not comparable* across a source switch. **Observed Change ≠ Actual Consumption**, and never a production-order shortage.
+
+Rows are shown 200 at a time; up to 5,000 alerts and 2,000 observed changes are loaded, and totals are always counted.
+
+**Alert history** is bounded without losing what the window needs. The newest 200 evaluations are kept, plus the latest verified evaluation of every file scope and every evaluation that a stored alert refers to. Resolved alerts are kept for 180 days. Failed attempts are pruned the same way. This is separate from the M3.2B inventory and sync-log retention, which is unchanged.
+
+**One-time database upgrade.** Alerts need schema 3 of the local database. A new database is created at schema 3. An existing database stays as it is (schema 1, or schema 2 from an M3.2C development build), with every other function unchanged, until you choose **Upgrade database…** in the Stock Alerts window. That shows a preview (default *No*), writes a verified backup to the `backups` subfolder, and applies the change in one transaction; existing inventory rows are not rewritten and nothing is deleted. From schema 2, existing alerts are attributed to the files they came from. From schema 1, the current Storage file is read once more afterwards to capture its thresholds: a version imported before the upgrade shows "thresholds not captured", never blank or 0. Older development builds cannot open an upgraded database; keep the backup if you need to go back.
+
+## Inventory History (M4A, in development)
+
+Click **Inventory History…** in the top file area to open a separate, read-only window. It shows what the synchronised Storage versions recorded for one Material ID. Everything in it is a **historical observation**: the banner **HISTORICAL OBSERVATIONS · Not current stock · Cloud Not Verified** is always shown, and the window never uses `Local Sources Verified`. The CHECK area, its rules and export are unchanged.
+
+1. Type part of a Material ID (same matching as the checker: letter case and surrounding spaces ignored). Candidates come from IDs ever stored for Storage. Typing alone does not query; **select one exact ID**. Similar IDs (for example `A-1` and `A-10`) are separate and never merged. IDs stored in numeric cells are not text keys and cannot be selected.
+2. Choose a **Storage Sheet** (or all Sheets, each row labelled with its own Sheet) and **30 / 60 / 90 days**. The window start is inclusive.
+3. **Records** lists, newest first, every stored row of that ID in each snapshot: snapshot time, Material ID, description, the raw stock value with its data status, Rack, Level, source file, Sheet, row and version. Selecting a row shows the full path. The last snapshot before the window is included and marked **Before window**: it is the recorded state at the window start, not a new observation.
+4. **Observed Changes** lists the differences between consecutive Storage versions: before and after times, before and after stock, the change type (quantity, added, removed, blank/invalid status change, duplicate rows changed) and an **observed difference only between two single valid records from the same source file**.
+
+What the window never does:
+
+| Situation | Shown as |
+|---|---|
+| Blank stock | `(blank)` · `BLANK — not 0` |
+| Text or other invalid quantity | the value as read · `INVALID — not converted` |
+| Duplicate ID in one Sheet | separate rows · `DUPLICATE ×n — not added`; changes have no difference |
+| Same ID in different Sheets or source files | separate rows; never merged |
+| Source file switched between versions | `not comparable (source switch)`, with a coverage note |
+| ID not in a snapshot | `NOT PRESENT — not 0` |
+| Rows removed by Local History maintenance | `NOT RETAINED — values unknown`; nothing is reconstructed |
+| History starting inside the window, or cleaned before it | an explicit coverage note; earlier stock is unknown, not 0 |
+
+**Observed Change ≠ Actual Consumption.** Storage is edited irregularly (receipts, corrections, recounts). A snapshot is recorded only when a new Storage version is imported.
+
+Each query reads one consistent, read-only view of the database on a background thread. If another program publishes a new version meanwhile, the result still belongs entirely to the earlier state; query again to see the new one. A newer query always replaces an older one, and closing the window discards pending results. Up to 1,000 records and 1,000 changes are loaded per query and shown 200 at a time (**Show more**); when more exist, the window says how many and asks for a narrower query. If the database cannot be read, the old result is cleared and **QUERY FAILED** is shown; nothing is presented as a successful query. The window does not write the database, the Excel files or Drive settings, and has no charts, forecasts, reorder suggestions or export.
+
 ## Safety
 
 The program reads the selected Storage and BOM workbooks and generates a separate report. It does not modify the source workbooks.
@@ -138,6 +199,9 @@ Python 3.10+ with Tkinter, and [openpyxl](https://openpyxl.readthedocs.io/). Win
 | `checker/reader.py` | Read-only workbook parsing, change detection, cache |
 | `checker/report.py`, `checker/report_style.py` | Excel report |
 | `checker/ui.py`, `checker/presentation.py` | Tkinter interface |
+| `checker/history.py`, `checker/history_ui.py` | M4A read-only Inventory History queries and window |
+| `checker/alerts.py`, `checker/alerts_ui.py` | M3.2C stock-alert evaluation, de-duplicated persistence, bounded runner and window |
+| `checker/upgrade.py` | Explicit, backed-up local database upgrade (schema 1 or 2 → 3) |
 | `tests/` | Automated tests using synthetic workbooks |
 
 A few file-behaviour tests run only when `MRC_TEST_MOUNT_DIR` names a folder on a mounted drive (for example Google Drive for Desktop). They create and delete their own temporary sub-folder there and are skipped otherwise.

@@ -3,7 +3,9 @@
 Change detection, cheapest first:
 1. the file is not there / not accessible             → UNAVAILABLE, nothing parsed;
 2. ZIP central-directory signature (CRC and size of every xl/ part, the same signature the reader cache uses)
-   equals the published version from the same path    → UNCHANGED, nothing parsed, no snapshot;
+   equals the published version from the same path    → UNCHANGED, nothing parsed, no snapshot (exception, schema 2:
+   a Storage version imported before thresholds were stored is captured once from the caller's parse, see
+   capture_thresholds; nothing else of the version changes);
 3. otherwise the file is parsed by the unchanged M2.1 reader, hashed, revalidated and published in ONE transaction.
 
 A failure at any point leaves the published version, its rows and its timestamps exactly as they were.
@@ -33,7 +35,7 @@ import time
 from typing import Callable
 
 from .core import DataReadError, Material, WorkbookData, material_key, number, numeric_code_text
-from .inventory_db import DatabaseError, connect, encode, initialise, stamp, utc_now
+from .inventory_db import DatabaseError, connect, encode, initialise, schema_version, stamp, utc_now
 from .reader import ReadOnlyCache, fingerprint, owner_lock_files
 
 PARSER_VERSION = "m2.1"  # rows are produced by checker.reader exactly as the BOM Checker reads them
@@ -169,6 +171,8 @@ class InventorySync:
                     and current["content_signature"] == signature:
                 self._checkpoint("compared", role)
                 result = self._record_unchanged(role, path, trigger, started, before, current["id"])
+                if role == "stock":  # schema 2: a version imported before thresholds were stored gets them once
+                    self.capture_thresholds(path, before, current["id"], parse)
             else:
                 notify(role, SYNCING)
                 self._wait_until_settled(before)
@@ -316,7 +320,7 @@ class InventorySync:
                  json.dumps(list(book.notes), ensure_ascii=False), len(sheets),
                  sum(len(s.materials) for s in sheets))).lastrowid
             if role == "stock":
-                keys = self._write_stock(conn, version_id, book)
+                keys = self._write_stock(conn, version_id, book, thresholds=schema_version(conn) >= 2)
                 snapshot_id = self._write_snapshot(conn, version_id, current, now)
             else:
                 keys = self._write_bom(conn, version_id, book)
@@ -343,11 +347,15 @@ class InventorySync:
         return SyncResult(role, path, trigger, IMPORTED, started, version_id, snapshot_id, observed=print_)
 
     # ------------------------------------------------------------------ writers (inside the publish transaction)
-    def _write_stock(self, conn, version_id, book) -> set[str]:
+    def _write_stock(self, conn, version_id, book, thresholds=False) -> set[str]:
+        """thresholds: schema 2 also stores each Sheet's MIN QTY / MIIN QTY column and every row's raw threshold."""
         keys, issues = set(), []
         for index, sheet in enumerate(book.stock_sheets):
             sheet_id = conn.execute("INSERT INTO stock_sheets (source_version_id, sheet_index, sheet_name, header_row)"
                                     " VALUES (?, ?, ?, ?)", (version_id, index, sheet.name, sheet.header_row)).lastrowid
+            if thresholds:
+                conn.execute("UPDATE stock_sheets SET threshold_state = ?, threshold_column = ?, threshold_header = ?,"
+                             " threshold_candidates = ? WHERE id = ?", (*_sheet_threshold(sheet), sheet_id))
             counts = defaultdict(int)
             for m in sheet.materials:
                 key = _identity(m)[0]
@@ -369,6 +377,15 @@ class InventorySync:
                 if key and counts[key] > 1:
                     issues.append((version_id, "stock", sheet.name, m.source.row, "DUPLICATE_STOCK", key, _raw(m.code),
                                    f"同一 Sheet 内有 {counts[key]} 条相同编号的记录；保留为独立记录，不相加、不合并。"))
+            if thresholds:
+                rows = [(*row, *_threshold(m)) for row, m in zip(rows, sheet.materials)]
+                conn.executemany(
+                    "INSERT INTO stock_records (source_version_id, stock_sheet_id, ordinal, row_no, code_kind, code_text,"
+                    " code_cell_type, material_key, numeric_code, description_kind, description_text, qty_kind, qty_text,"
+                    " qty_cell_type, qty_status, qty_value, rack_kind, rack_text, level_kind, level_text, section,"
+                    " threshold_kind, threshold_text, threshold_cell_type)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
+                continue
             conn.executemany(
                 "INSERT INTO stock_records (source_version_id, stock_sheet_id, ordinal, row_no, code_kind, code_text,"
                 " code_cell_type, material_key, numeric_code, description_kind, description_text, qty_kind, qty_text,"
@@ -376,6 +393,59 @@ class InventorySync:
                 " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", rows)
         self._write_issues(conn, issues)
         return keys
+
+    def capture_thresholds(self, path, observed, version_id, parse=None) -> bool:
+        """Schema 2: fill the thresholds of a Storage version imported before they were stored (schema 1), from a
+        parse of exactly that file version. Only empty (not captured) threshold fields are written, and only when the
+        parse has the version's content signature and every Sheet / row / Material ID matches the stored rows.
+        Returns True when thresholds were captured. Never raises: thresholds then stay 'not captured'."""
+        try:
+            with self._connection() as conn:
+                if schema_version(conn) < 2 or not conn.execute(
+                        "SELECT 1 FROM stock_sheets WHERE source_version_id = ? AND threshold_state IS NULL",
+                        (version_id,)).fetchone():
+                    return False
+            book = (parse or (lambda p, r: ReadOnlyCache().read(p, r)))(path, "stock")
+            if book.fingerprint != observed:
+                return False
+            conn = self.connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                current = self._current(conn, "stock")
+                if current is None or current["id"] != version_id \
+                        or current["content_signature"] != content_signature(book.fingerprint):
+                    raise SourceChanged("threshold capture: version changed")
+                sheets = conn.execute("SELECT * FROM stock_sheets WHERE source_version_id = ? ORDER BY sheet_index",
+                                      (version_id,)).fetchall()
+                if [(s["sheet_name"], s["header_row"]) for s in sheets] != \
+                        [(s.name, s.header_row) for s in book.stock_sheets]:
+                    raise SourceChanged("threshold capture: Sheets differ")
+                for stored, sheet in zip(sheets, book.stock_sheets):
+                    if stored["threshold_state"] is not None:
+                        continue
+                    records = conn.execute("SELECT id, row_no, material_key, threshold_kind FROM stock_records"
+                                           " WHERE stock_sheet_id = ? ORDER BY ordinal", (stored["id"],)).fetchall()
+                    if [(r["row_no"], r["material_key"]) for r in records] != \
+                            [(m.source.row, _identity(m)[0]) for m in sheet.materials]:
+                        raise SourceChanged("threshold capture: rows differ")
+                    conn.executemany("UPDATE stock_records SET threshold_kind = ?, threshold_text = ?,"
+                                     " threshold_cell_type = ? WHERE id = ? AND threshold_kind IS NULL"
+                                     " AND threshold_cell_type IS NULL",
+                                     [(*_threshold(m), r["id"]) for r, m in zip(records, sheet.materials)])
+                    conn.execute("UPDATE stock_sheets SET threshold_state = ?, threshold_column = ?, threshold_header = ?,"
+                                 " threshold_candidates = ? WHERE id = ?", (*_sheet_threshold(sheet), stored["id"]))
+                if fingerprint(path) != observed:
+                    raise SourceChanged("threshold capture: file changed")
+                conn.execute("COMMIT")
+                return True
+            except BaseException:
+                if conn.in_transaction:
+                    conn.execute("ROLLBACK")
+                raise
+            finally:
+                conn.close()
+        except Exception:
+            return False
 
     def _write_bom(self, conn, version_id, book) -> set[str]:
         keys, issues = set(), []
@@ -482,6 +552,17 @@ class InventorySync:
             ((snapshot_id, sheet, key, change[0], *_side(before), *_side(after), change[1])
              for (sheet, key), change, before, after in changes))
         return snapshot_id
+
+
+def _threshold(m: Material) -> tuple:
+    """(kind, text, cell type) of a row's raw threshold; cell type None when the Sheet has no single threshold column."""
+    return (*encode(m.threshold), m.threshold_type or None)
+
+
+def _sheet_threshold(sheet) -> tuple:
+    candidates = json.dumps([list(c) for c in sheet.threshold_candidates], ensure_ascii=False) \
+        if sheet.threshold_candidates else None
+    return sheet.threshold_state, sheet.threshold_column, sheet.threshold_header, candidates
 
 
 def _side(rows):

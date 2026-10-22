@@ -303,19 +303,28 @@ def load_workbook_data(conn, role: str, version_id: int | None = None) -> Workbo
     path = version["source_path"]
 
     def material(row, sheet_name, extra):
+        keys = row.keys()
+        threshold = ((decode(row["threshold_kind"], row["threshold_text"]), row["threshold_cell_type"] or "")
+                     if "threshold_kind" in keys else (None, ""))  # schema 2 only
         return Material(Source(path, sheet_name, row["row_no"]), decode(row["code_kind"], row["code_text"]),
                         decode(row["description_kind"], row["description_text"]),
                         decode(row["qty_kind"], row["qty_text"]), row["qty_cell_type"], row["code_cell_type"],
                         decode(row[f"{extra[0]}_kind"], row[f"{extra[0]}_text"]),
-                        decode(row[f"{extra[1]}_kind"], row[f"{extra[1]}_text"]), row["section"])
+                        decode(row[f"{extra[1]}_kind"], row[f"{extra[1]}_text"]), row["section"], *threshold)
 
     stock_sheets, products = [], []
     if role == "stock":
         for sheet in conn.execute("SELECT * FROM stock_sheets WHERE source_version_id = ? ORDER BY sheet_index",
                                   (version["id"],)).fetchall():
             rows = conn.execute("SELECT * FROM stock_records WHERE stock_sheet_id = ? ORDER BY ordinal", (sheet["id"],))
+            # A version imported before thresholds were stored (schema 1, or not yet captured) says so explicitly.
+            state = sheet["threshold_state"] if "threshold_state" in sheet.keys() else None
+            candidates = (tuple(tuple(c) for c in json.loads(sheet["threshold_candidates"]))
+                          if state and sheet["threshold_candidates"] else ())
             stock_sheets.append(StockSheet(sheet["sheet_name"], sheet["header_row"],
-                                           tuple(material(r, sheet["sheet_name"], ("rack", "level")) for r in rows)))
+                                           tuple(material(r, sheet["sheet_name"], ("rack", "level")) for r in rows),
+                                           state or "NOT_CAPTURED", sheet["threshold_column"] if state else None,
+                                           sheet["threshold_header"] if state else None, candidates))
     else:
         for product in conn.execute("SELECT * FROM bom_products WHERE source_version_id = ? ORDER BY sheet_index",
                                     (version["id"],)).fetchall():

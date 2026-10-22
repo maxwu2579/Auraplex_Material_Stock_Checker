@@ -9,6 +9,7 @@ from zipfile import BadZipFile, ZipFile
 import xml.etree.ElementTree as ET
 
 from openpyxl import load_workbook
+from openpyxl.utils import column_index_from_string, get_column_letter
 from openpyxl.utils.exceptions import InvalidFileException
 
 from .core import DataReadError, Material, Product, Source, StockSheet, WorkbookData, normalize_code, number, material_key
@@ -17,6 +18,12 @@ from .core import DataReadError, Material, Product, Source, StockSheet, Workbook
 STOCK_HEADER = {5: "PART NO", 6: "DESCRIPTION", 11: "RACKING", 12: "LEVEL", 15: "LIVE STOCK"}
 BOM_HEADER = {4: "PART NO", 5: "DESCRIPTION", 12: "QTY"}
 HEADER_SCAN_ROWS = 100
+# M3.2C minimum-stock candidates on the Storage header row. "MIIN QTY" is the confirmed spelling in the AURA Storage
+# workbook. Exactly these two headers are recognised (after the usual trim / upper-case normalisation); no fuzzy
+# matching. The Excel spelling is never changed and the original header text is kept.
+THRESHOLD_HEADERS = ("MIN QTY", "MIIN QTY")
+STOCK_SCAN_COLUMNS = 30  # Storage rows are read up to column AD, so a threshold column must lie within A–AD
+BOM_SCAN_COLUMNS = 18
 
 
 def fingerprint(path: str | Path) -> tuple:
@@ -87,9 +94,11 @@ class ReadOnlyCache:
                         header_row = None
                         materials = []
                         section = ""
-                        # Ignore inflated dimensions; parse actual worksheet rows, max 18 columns.
+                        candidates = ()        # threshold header candidates of this Sheet
+                        threshold_index = None  # 1-based column of the single threshold candidate, if exactly one
+                        # Ignore inflated dimensions; parse actual worksheet rows (BOM: 18 columns, Storage: up to AD).
                         sheet.reset_dimensions()
-                        for cells in sheet.iter_rows(max_col=18):
+                        for cells in sheet.iter_rows(max_col=STOCK_SCAN_COLUMNS if role == "stock" else BOM_SCAN_COLUMNS):
                             if cancelled is not None and cancelled.is_set():
                                 raise DataReadError("读取已取消。")
                             populated = [c for c in cells if c.value is not None]
@@ -106,6 +115,14 @@ class ReadOnlyCache:
                             if is_header:
                                 if header_row is None:
                                     header_row = row_no
+                                    if role == "stock":
+                                        candidates = tuple(
+                                            (get_column_letter(index), cell.value)
+                                            for index, cell in enumerate(cells, 1)
+                                            if index not in header and isinstance(cell.value, str)
+                                            and normalize_code(cell.value) in THRESHOLD_HEADERS)
+                                        if len(candidates) == 1:
+                                            threshold_index = column_index_from_string(candidates[0][0])
                                 continue
                             if header_row is None:
                                 continue
@@ -124,16 +141,26 @@ class ReadOnlyCache:
                                     number(value(2)) is not None and (description not in (None, "") or qty is not None))
                             if not is_material:
                                 continue
+                            threshold_cell = cells[threshold_index - 1] if threshold_index else None
                             materials.append(Material(Source(before[0], sheet.title, row_no), code, description, qty,
                                                       qty_cell.data_type, code_cell.data_type,
                                                       value(11) if role == "stock" else value(10),
-                                                      value(12) if role == "stock" else value(11), section))
+                                                      value(12) if role == "stock" else value(11), section,
+                                                      threshold_cell.value if threshold_cell is not None else None,
+                                                      threshold_cell.data_type if threshold_cell is not None else ""))
                         if header_row is None:
                             notes.append(f"{sheet.title!r}：未找到 M0 所需表头组合（前100行），未读取为{role}。")
                         elif not materials:
                             notes.append(f"{sheet.title!r}：无材料数据，未作为产品/库存。")
                         elif role == "stock":
-                            stock_sheets.append(StockSheet(sheet.title, header_row, tuple(materials)))
+                            if len(candidates) > 1:
+                                notes.append(f"{sheet.title!r}：发现多个最低库存候选列 " +
+                                             "、".join(f"{col} {text!r}" for col, text in candidates) +
+                                             "；未自动选择，需业务确认。")
+                            state = "FOUND" if len(candidates) == 1 else "AMBIGUOUS" if candidates else "NOT_FOUND"
+                            found = candidates[0] if len(candidates) == 1 else (None, None)
+                            stock_sheets.append(StockSheet(sheet.title, header_row, tuple(materials), state, found[0],
+                                                           found[1], candidates if len(candidates) > 1 else ()))
                             invalid_codes = sum(not material_key(m) for m in materials)
                             if invalid_codes:
                                 notes.append(f"{sheet.title!r}：{invalid_codes}条库存编号为空、非文本、公式或错误，不用于连接。")

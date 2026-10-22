@@ -12,11 +12,12 @@ import sqlite3
 import time
 import uuid
 
-from .inventory_db import SCHEMA_VERSION, parse_stamp, stamp, utc_now
+from .inventory_db import SUPPORTED_SCHEMA_VERSIONS, parse_stamp, stamp, tables_for, utc_now
 from .queries import open_readonly
 
-TABLES = ('schema_info', 'source_versions', 'current_sources', 'sync_runs', 'materials', 'stock_sheets',
-          'stock_records', 'bom_products', 'bom_lines', 'inventory_snapshots', 'inventory_changes', 'data_quality_issues')
+# Schema 2 adds the M3.2C alert tables (inventory_db.TABLES_2). They are covered by validation, preview digest and
+# backup, and are never pruned here (checker.alerts keeps them bounded). Their version references point at
+# source-version headers, which cleanup never deletes.
 
 
 class RetentionError(ValueError):
@@ -72,10 +73,11 @@ def _identity(path):
 
 
 def _validate(conn):
-    if conn.execute('PRAGMA user_version').fetchone()[0] != SCHEMA_VERSION:
+    version = conn.execute('PRAGMA user_version').fetchone()[0]
+    if version not in SUPPORTED_SCHEMA_VERSIONS:
         raise RetentionReadError('Unsupported database schema; cleanup refused.')
     names = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")}
-    if names != set(TABLES) or conn.execute("SELECT 1 FROM sqlite_master WHERE type='trigger'").fetchone():
+    if names != set(tables_for(version)) or conn.execute("SELECT 1 FROM sqlite_master WHERE type='trigger'").fetchone():
         raise RetentionReadError('Unrecognised database tables/triggers; cleanup refused.')
     if conn.execute('PRAGMA quick_check').fetchone()[0] != 'ok' or conn.execute('PRAGMA foreign_key_check').fetchone():
         raise RetentionReadError('Database integrity check failed; cleanup refused.')
@@ -86,7 +88,7 @@ def _digest(conn):
     digest = hashlib.sha256()
     for row in conn.execute('SELECT type,name,tbl_name,sql FROM sqlite_master ORDER BY type,name'):
         digest.update(json.dumps(tuple(row), ensure_ascii=True).encode())
-    for table in TABLES:
+    for table in tables_for(conn.execute('PRAGMA user_version').fetchone()[0]):
         digest.update(table.encode())
         for row in conn.execute(f'SELECT * FROM {table} ORDER BY 1'):
             digest.update(json.dumps(tuple(row), ensure_ascii=True).encode())

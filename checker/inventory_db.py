@@ -8,11 +8,17 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta, timezone
 from decimal import Decimal
+import os
 from pathlib import Path
 import sqlite3
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3               # created for new databases
+LEGACY_SCHEMA_VERSION = 1        # usable as before; upgraded only by the explicit, backed-up upgrade
+# 2 = thresholds + first alert tables (M3.2C development); 3 = alert identity/provenance per source file.
+# Every supported version opens unchanged; stock alerts need 3 (checker.upgrade: 1 → 3 or 2 → 3, explicit).
+SUPPORTED_SCHEMA_VERSIONS = (LEGACY_SCHEMA_VERSION, 2, SCHEMA_VERSION)
+ALERT_SCHEMA_VERSION = 3
 
 
 class DatabaseError(Exception):
@@ -193,6 +199,81 @@ CREATE TABLE data_quality_issues (
 CREATE INDEX data_quality_version ON data_quality_issues (source_version_id, issue_type);
 """
 
+# Schema 2 (M3.2C) only adds. New databases apply SCHEMA then these statements; an existing schema-1 database receives
+# the same statements only through checker.upgrade (preview, explicit consent, verified backup, one transaction), so
+# both paths end with identical schema SQL. Existing rows are not rewritten by the upgrade.
+UPGRADE_TO_2 = (
+    # Threshold column of each Storage Sheet. NULL state = not captured (a version imported under schema 1).
+    "ALTER TABLE stock_sheets ADD COLUMN threshold_state TEXT",       # FOUND / NOT_FOUND / AMBIGUOUS
+    "ALTER TABLE stock_sheets ADD COLUMN threshold_column TEXT",      # column letter of the single candidate
+    "ALTER TABLE stock_sheets ADD COLUMN threshold_header TEXT",      # original header text, spelling unchanged
+    "ALTER TABLE stock_sheets ADD COLUMN threshold_candidates TEXT",  # JSON [[column, header], ...] when AMBIGUOUS
+    # Raw minimum-stock candidate of each Storage row, lossless like the other raw values.
+    "ALTER TABLE stock_records ADD COLUMN threshold_kind TEXT",
+    "ALTER TABLE stock_records ADD COLUMN threshold_text TEXT",
+    "ALTER TABLE stock_records ADD COLUMN threshold_cell_type TEXT",
+    # One row per alert evaluation. Bounded: only the most recent evaluations are kept (checker.alerts).
+    """CREATE TABLE alert_evaluations (
+    id                INTEGER PRIMARY KEY,
+    trigger           TEXT NOT NULL,
+    started_at        TEXT NOT NULL,
+    finished_at       TEXT NOT NULL,
+    outcome           TEXT NOT NULL CHECK (outcome IN ('COMPLETED', 'UNVERIFIED', 'FAILED')),
+    stock_version_id  INTEGER REFERENCES source_versions (id),
+    bom_version_id    INTEGER REFERENCES source_versions (id),
+    sources_verified  INTEGER NOT NULL,      -- 1 only when both roles were Local File Checked for this evaluation
+    sheet_scope       TEXT,                  -- JSON list of the Storage Sheets evaluated
+    summary           TEXT,                  -- JSON counts and notes
+    error_message     TEXT
+)""",
+    # One row per alert identity (de-duplication). Never merges materials, Sheets, products or quantities.
+    """CREATE TABLE stock_alerts (
+    id                      INTEGER PRIMARY KEY,
+    alert_key               TEXT NOT NULL UNIQUE,  -- JSON identity: type, subtype, Storage Sheet, key or row
+    alert_type              TEXT NOT NULL CHECK (alert_type IN ('OUT_OF_STOCK', 'LOW_STOCK',
+                            'BOM_MATERIAL_NOT_IN_STOCK_MASTER', 'DATA_ISSUE', 'THRESHOLD_NOT_CONFIGURED')),
+    subtype                 TEXT NOT NULL,
+    stock_sheet             TEXT NOT NULL,
+    material_key            TEXT,
+    status                  TEXT NOT NULL CHECK (status IN ('ACTIVE', 'RESOLVED')),
+    first_seen_at           TEXT NOT NULL,
+    last_seen_at            TEXT NOT NULL,
+    resolved_at             TEXT,
+    first_evaluation_id     INTEGER NOT NULL,
+    last_evaluation_id      INTEGER NOT NULL,
+    resolved_evaluation_id  INTEGER,
+    stock_version_id        INTEGER REFERENCES source_versions (id),
+    bom_version_id          INTEGER REFERENCES source_versions (id),
+    detail                  TEXT NOT NULL     -- JSON: raw values, rows, occurrences, notes of the last observation
+)""",
+    "CREATE INDEX stock_alerts_status ON stock_alerts (status, alert_type)",
+)
+# Schema 3 (M3.2C remediation) only adds: the source scope of every alert and evaluation, so alerts of different
+# Storage/BOM files are never one alert and one file's evaluation can never resolve another file's alert. A schema-2
+# database gets these columns through checker.upgrade, which also attributes its existing alerts to their files
+# (from the recorded version headers) in the same transaction. Nothing is reset or deleted.
+UPGRADE_TO_3 = (
+    "ALTER TABLE alert_evaluations ADD COLUMN storage_source TEXT",  # normalised Storage file identity
+    "ALTER TABLE alert_evaluations ADD COLUMN bom_source TEXT",      # normalised BOM file identity
+    "ALTER TABLE stock_alerts ADD COLUMN storage_source TEXT",       # part of the alert identity
+    "ALTER TABLE stock_alerts ADD COLUMN bom_source TEXT",           # part of the identity of BOM-coverage alerts
+    "CREATE INDEX stock_alerts_scope ON stock_alerts (storage_source, status)",
+)
+TABLES_1 = ('schema_info', 'source_versions', 'current_sources', 'sync_runs', 'materials', 'stock_sheets',
+            'stock_records', 'bom_products', 'bom_lines', 'inventory_snapshots', 'inventory_changes', 'data_quality_issues')
+TABLES_2 = TABLES_1 + ('alert_evaluations', 'stock_alerts')
+
+
+def tables_for(version: int) -> tuple[str, ...]:
+    return {1: TABLES_1, 2: TABLES_2, 3: TABLES_2}[version]
+
+
+def source_identity(path: str | None) -> str | None:
+    """Normalised identity of a source file (letter case and separators as Windows compares them)."""
+    if not path:
+        return None
+    return os.path.normcase(os.path.normpath(os.path.abspath(path)))
+
 
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -267,8 +348,13 @@ def connect(path: str | Path) -> sqlite3.Connection:
     return connection
 
 
+def schema_version(conn) -> int:
+    return conn.execute("PRAGMA user_version").fetchone()[0]
+
+
 def initialise(path: str | Path, app_version: str = "") -> None:
-    """Create the schema on first use, accept the current version, refuse a database from a newer release."""
+    """Create the schema on first use; accept the current and the legacy schema unchanged (a schema-1 database is
+    never migrated here: see checker.upgrade); refuse a database from a newer release or a foreign file."""
     path = Path(path)
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -276,8 +362,8 @@ def initialise(path: str | Path, app_version: str = "") -> None:
     except (OSError, sqlite3.Error) as exc:
         raise DatabaseError(f"无法打开本地数据库 {path}：{exc}") from exc
     try:
-        version = connection.execute("PRAGMA user_version").fetchone()[0]
-        if version == SCHEMA_VERSION:
+        version = schema_version(connection)
+        if version in SUPPORTED_SCHEMA_VERSIONS:
             return
         if version > SCHEMA_VERSION:
             raise DatabaseError(f"本地数据库 {path} 由更新版本的程序创建（schema {version}），本版本不会修改它。")
@@ -285,7 +371,8 @@ def initialise(path: str | Path, app_version: str = "") -> None:
             raise DatabaseError(f"{path} 不是本程序的数据库（无版本号但含有数据），不会修改它。")
         try:
             # One transaction: the schema, its metadata and the version number appear together or not at all.
-            connection.executescript(f"BEGIN IMMEDIATE;\n{SCHEMA}\nPRAGMA user_version = {SCHEMA_VERSION};")
+            upgrade = "".join(statement + ";\n" for statement in UPGRADE_TO_2 + UPGRADE_TO_3)
+            connection.executescript(f"BEGIN IMMEDIATE;\n{SCHEMA}\n{upgrade}PRAGMA user_version = {SCHEMA_VERSION};")
             connection.executemany("INSERT INTO schema_info (key, value) VALUES (?, ?)",
                                    (("schema_version", str(SCHEMA_VERSION)), ("created_at", stamp(utc_now())),
                                     ("created_by", app_version or "unknown")))

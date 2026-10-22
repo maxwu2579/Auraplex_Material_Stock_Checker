@@ -13,12 +13,14 @@ from tkinter import font as tkfont
 
 from .core import (DataReadError, ENOUGH, EXCEPTION, ROW_CAVEAT, SHORTAGE, check_materials, display,
                    production_quantity, search_products, select_product)
-from . import binding, cached, retention
+from . import alerts, binding, cached, retention, upgrade
 from .queries import overall_state, overall_times, status_text, with_known_failures
 from .sync import (CHECKING, CLOUD_NOT_VERIFIED, DATABASE_UNAVAILABLE, LOCAL_VERIFIED, NOT_SYNCED, SOURCE_CHANGED,
                    SOURCE_UNAVAILABLE, STATUS_UNKNOWN, SYNC_FAILED, USING_PREVIOUS)
 from .report import ReportError, default_filename, save_verified_report
 from .service import CheckerService
+from .history_ui import HistoryWindow
+from .alerts_ui import AlertsWindow
 from .presentation import BG, INK, MUTED, BLUE, RED, AMBER, Tooltip, ellipsize, work_area
 
 
@@ -29,7 +31,9 @@ ROLE_NAMES = {"stock": "Storage", "bom": "BOM"}
 NOTICE_TEXT = "Results are calculated from the selected BOM and current saved Storage data."
 SHORT_TIME = "%Y-%m-%d %H:%M"  # compact panel; the details popup shows seconds
 JOB_STATUS = {"检查材料": "Checking materials…", "启动检查": "Checking Excel sources…", "刷新 Excel": "Refreshing Excel…",
-              "预览历史清理": "Preparing local cleanup preview…", "清理历史数据": "Backing up and cleaning local history…"}
+              "预览历史清理": "Preparing local cleanup preview…", "清理历史数据": "Backing up and cleaning local history…",
+              "预览数据库升级": "Preparing database upgrade preview…", "升级数据库": "Backing up and upgrading local database…"}
+MAINTENANCE_JOBS = ("预览历史清理", "清理历史数据", "预览数据库升级", "升级数据库")
 LOCAL_COPY_NOTE = ("Local File Checked = at the Last Verified time, the database matched one version of the Excel file "
                    "on this computer. The file can change at any moment afterwards, and Google Drive may not have "
                    "downloaded newer cloud changes yet: the cloud copy is never checked (Cloud Not Verified).")
@@ -60,6 +64,22 @@ class CheckerApp:
         self.sync_failures = {}    # role -> failed SyncResult seen by this program; beats older SQLite records
         self.stock_book = self.bom_book = self.result = None
         self.result_binding = None # binding.SourceBinding of the shown result: which source versions it belongs to
+        self.history_window = None   # M4A Inventory History window (read-only), at most one
+        # M3.2C stock alerts: one evaluation at a time (+1 pending), evaluated after both files verified this session.
+        self.alert_gate = alerts.SessionGate()  # invalidated on every selection / sync / failure / read failure
+        self.alert_runner = (alerts.AlertRunner(alerts.AlertService(inventory.db_path), self.alert_gate)
+                             if inventory is not None else None)
+        self.alerts_window = None
+        self.verified_roles = set()  # roles whose latest sync in this session verified the local file
+        self.alert_sources = {}      # role -> (version ID, selected path) of that verification
+        self.alert_status_events = queue.Queue()
+        self.alert_schema = None     # database schema, once read
+        self.alert_active = None     # ACTIVE alerts of the current files, as stored
+        self.alert_current = False   # re-checked by a verified evaluation of this session, at this gate generation
+        self.alert_reason = "not re-checked since this program started"
+        self.alert_read_error = None  # last alert/status read failure, until a later read succeeds
+        self.alert_text = "Stock Alerts"
+        self.deferred_alerts = None  # an evaluation requested while a job was running
         self.cache_selection = None  # explicit opt-in for this session only; never restored from settings
         self.cache_authorized = False
         self.maintenance_message = ''
@@ -88,6 +108,8 @@ class CheckerApp:
             var.trace_add("write", lambda *_: self.invalidate())
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.poll_id = self.root.after(50, self._poll)
+        if self.alert_runner is not None:
+            self._load_alert_status()
         if self.inventory is not None or self.settings is not None:
             self._startup()
 
@@ -144,12 +166,29 @@ class CheckerApp:
         heading = ttk.Frame(self.overview_content)
         heading.grid(row=0, sticky="ew", pady=(0, 12))
         if self.inventory is not None:
-            self.cache_button = ttk.Button(heading, text="Use Cached Data…", command=self.use_cached_data,
+            actions = ttk.Frame(heading)
+            actions.pack(side="right", anchor="n")
+            buttons = ttk.Frame(actions)
+            buttons.pack(anchor="e")
+            self.cache_button = ttk.Button(buttons, text="Use Cached Data…", command=self.use_cached_data,
                                            padding=(8, 3))
             self.cache_button.pack(side="right", padx=(12, 0))
-            self.maintenance_button = ttk.Button(heading, text="Local History…", command=self.preview_cleanup,
+            self.maintenance_button = ttk.Button(buttons, text="Local History…", command=self.preview_cleanup,
                                                  padding=(8, 3))
             self.maintenance_button.pack(side="right", padx=(8, 0))
+            # M4A: read-only historical observations in a separate window; never part of CHECK or export.
+            self.history_button = ttk.Button(buttons, text="Inventory History…", command=self.open_history,
+                                             padding=(8, 3))
+            self.history_button.pack(side="right", padx=(8, 0))
+            # M3.2C: alert count of the last verified evaluation, under the buttons (uses the title's height; the
+            # Inventory Database panel and the CHECK row are unchanged). Click opens Stock Alerts.
+            self.alerts_label = ttk.Label(actions, text=self.alert_text, font=("Segoe UI", 9, "underline"),
+                                          foreground="#95641a", cursor="hand2")
+            self.alerts_label.pack(anchor="e", pady=(3, 0))
+            self.alerts_label.bind("<Button-1>", lambda _e: self.open_alerts())
+            Tooltip(self.alerts_label, lambda: "Stock Alerts (M3.2C) from synchronised Excel data. Thresholds and "
+                    "units pending business confirmation. Cloud Not Verified. Click to open." +
+                    ("" if self.alert_current else f"\nNot re-checked: {self.alert_reason}"))
         ttk.Label(heading, text="Material Requirement & Stock Checker", style="Title.TLabel").pack(anchor="w")
         ttk.Label(heading, text="Check material requirements against current stock.", style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
         files = ttk.Frame(self.overview_content)
@@ -529,6 +568,8 @@ class CheckerApp:
         if self.inventory is None:
             messagebox.showerror('Local History', 'A readable local database is required.', parent=self.root)
             return
+        if self._alerts_running('Local History'):
+            return
         service = retention.RetentionService(self.inventory.db_path)
         def done(result):
             self.maintenance_message = ('Local history cleanup completed' if result.backup else 'Nothing expired')
@@ -548,6 +589,227 @@ class CheckerApp:
                 return
             self._start(lambda: service.apply(plan, self.cancelled), done, '清理历史数据')
         self._start(service.preview, offer, '预览历史清理')
+
+    def open_history(self):
+        """M4A: open (or bring forward) the read-only Inventory History window. Independent of CHECK, cache mode and
+        maintenance: it reads the database in its own consistent read transactions and changes nothing here."""
+        if self.inventory is None:
+            messagebox.showerror("Inventory History", "A readable local database is required.", parent=self.root)
+            return
+        if self.history_window is not None and not self.history_window.closed:
+            self.history_window.lift()
+            return
+        def closed(window):
+            if self.history_window is window:
+                self.history_window = None
+        self.history_window = HistoryWindow(self.root, self.inventory.db_path, on_close=closed)
+
+    # ------------------------------------------------------------------ M3.2C stock alerts
+    # The entry line and the window combine two things: the alerts stored in the database (counts, history) and
+    # whether THIS session has verified them. Only an evaluation requested at the current gate generation, with both
+    # files verified by this program and accepted as COMPLETED under the database lock, makes the alerts current.
+    # Everything else (start-up, a source selection, a sync in progress or failed, a database read failure, an
+    # obsolete background result) shows the stored alerts as "not re-checked" and never resolves them.
+    def open_alerts(self):
+        if self.alert_runner is None:
+            messagebox.showerror("Stock Alerts", "A readable local database is required.", parent=self.root)
+            return
+        if self.alerts_window is not None and not self.alerts_window.closed:
+            self.alerts_window.lift()
+            return
+        self.alerts_window = AlertsWindow(self.root, self)
+
+    def sources_verified(self) -> bool:
+        """Both files verified by this program's own latest sync in this session, and no failure seen since."""
+        return (self.verified_roles == {"stock", "bom"} and not self.sync_failures
+                and self.inventory_read_error is None and set(self.alert_sources) == {"stock", "bom"})
+
+    def alert_authorization(self):
+        """What this session verified, at the current gate generation; None when it cannot authorise anything."""
+        if not self.sources_verified():
+            return None
+        return alerts.Authorization(self.alert_gate.generation,
+                                    tuple((role, *self.alert_sources[role]) for role in ("stock", "bom")))
+
+    def _invalidate_alerts(self, reason, roles=("stock", "bom"), read_failure=False):
+        """A selection, sync, failure or read failure: earlier verification no longer applies.
+
+        roles: whose verification EVIDENCE is discarded as well (not only re-stamped with a new generation). Only new
+        successful source checks of those roles can authorise a verified evaluation again; a manual Re-evaluate
+        cannot. A database read failure discards the evidence of both. The gate generation always moves on, so a
+        running evaluation cannot publish (SessionGate.publishing is checked around its COMMIT)."""
+        if self.alert_runner is None:
+            return
+        for role in roles:
+            self.verified_roles.discard(role)
+            self.alert_sources.pop(role, None)
+        self.alert_gate.invalidate()
+        self.alert_current = False
+        self.alert_reason = reason
+        if read_failure:
+            self.alert_read_error = reason
+        self._render_alerts()
+
+    def alert_read_failed(self, error):
+        """Any failed read of alert/status/observed-change data (window or background): unknown, not deleted."""
+        self._invalidate_alerts(f"the local database could not be read ({error})", read_failure=True)
+
+    def alert_read_ok(self):
+        """A later successful read: the data is readable again; it does not re-verify anything."""
+        if self.alert_read_error is not None:
+            self.alert_read_error = None
+            self._render_alerts()
+
+    def request_alerts(self, trigger):
+        """Evaluate from the synchronised data on the alert worker (one at a time, one pending)."""
+        if self.alert_runner is None or self.closed:
+            return
+        if self.busy:  # never write alerts while a job (sync, cleanup, upgrade) runs; evaluate when it ends
+            self.deferred_alerts = trigger
+            return
+        authorization = self.alert_authorization()
+        if authorization is None and self.alert_current:
+            self._invalidate_alerts("the Excel files are not both verified in this session", roles=())
+        self.alert_runner.request(trigger, authorization)
+        self._render_alerts()
+
+    def _alerts_running(self, title):
+        """Maintenance previews wait for a running alert evaluation (it writes the database)."""
+        if self.alert_runner is not None and self.alert_runner.running:
+            messagebox.showinfo(title, "Stock alerts are being evaluated. Please try again in a moment.",
+                                parent=self.root)
+            return True
+        return False
+
+    def alert_text_now(self):
+        if self.alert_schema is not None and self.alert_schema < alerts.ALERT_SCHEMA_VERSION:
+            return "Stock Alerts: upgrade required"
+        text = "Stock Alerts: not evaluated" if self.alert_active is None else f"Stock Alerts: {self.alert_active} active"
+        if self.alert_active is not None and not self.alert_current:
+            text += " · not re-checked"
+        if self.alert_read_error is not None:
+            text += " · database read failed"
+        if self.alert_runner is not None and self.alert_runner.running:
+            text += " · evaluating…"
+        return text
+
+    def _render_alerts(self):
+        self.alert_text = self.alert_text_now()
+        if self.alert_runner is not None:
+            self.alerts_label.configure(text=self.alert_text)
+            if self.alerts_window is not None and not self.alerts_window.closed:
+                self.alerts_window.show_session_state()
+
+    def _load_alert_status(self):
+        """Background read of the stored alert state (counts only; it can never mark alerts as re-checked)."""
+        database = self.inventory.db_path
+
+        def worker():
+            try:
+                self.alert_status_events.put((alerts.load_state(database, limit=0), None))
+            except Exception as exc:
+                self.alert_status_events.put((None, exc))
+        threading.Thread(target=worker, daemon=True, name="m32c-alert-status").start()
+
+    def _drain_alert_events(self):
+        if self.alert_runner is None:
+            return
+        if self.deferred_alerts is not None and not self.busy:
+            trigger, self.deferred_alerts = self.deferred_alerts, None
+            self.request_alerts(trigger)
+        changed = False
+        while True:
+            try:
+                state, error = self.alert_status_events.get_nowait()
+            except queue.Empty:
+                break
+            changed = True
+            if error is not None:
+                self.alert_read_failed(error)
+            else:
+                self.alert_read_ok()
+                self.alert_schema = state.schema
+                if state.schema >= alerts.ALERT_SCHEMA_VERSION:
+                    self.alert_active = (sum(state.active_counts.values()) if state.latest_completed is not None
+                                         else self.alert_active)
+        refreshed = False
+        while True:
+            try:
+                generation, result, error = self.alert_runner.events.get_nowait()
+            except queue.Empty:
+                break
+            changed = refreshed = True
+            if isinstance(error, alerts.AlertUnavailable):
+                if "schema" in str(error):
+                    self.alert_schema = 1
+            elif error is not None and not isinstance(error, alerts.AlertStale):
+                self._invalidate_alerts(f"the last evaluation failed ({error})", read_failure=True)
+            elif result is not None:
+                self.alert_read_ok()
+                self.alert_schema = alerts.ALERT_SCHEMA_VERSION
+                self.alert_active = result.active  # stored facts about the evaluated files
+                current = (result.verified and self.alert_gate.valid(generation) and self.sources_verified())
+                if current:
+                    self.alert_current = True
+                    self.alert_reason = None
+                elif not self.alert_gate.valid(generation):
+                    pass  # obsolete: a newer selection/sync/failure owns the state; never clear its warning
+                else:
+                    self.alert_current = False
+                    self.alert_reason = result.reason or "the evaluation could not verify the Excel files"
+        if changed:
+            self._render_alerts()
+        if refreshed and self.alerts_window is not None and not self.alerts_window.closed:
+            self.alerts_window.reload()
+
+    def _note_sync(self, report):
+        """After any job with a sync: record what this session verified; evaluate when both files are verified."""
+        if self.alert_runner is None or report is None:
+            return
+        results, roles, db_error = report
+        failed = []
+        for role, result in results.items():
+            if result.ok and result.version_id is not None:
+                self.verified_roles.add(role)
+                self.alert_sources[role] = (result.version_id, result.path)
+            else:
+                self.verified_roles.discard(role)
+                self.alert_sources.pop(role, None)
+                failed.append(f"{ROLE_NAMES[role]}: {result.error or result.outcome}")
+        if db_error:
+            failed.append(f"database status could not be read: {db_error}")
+        if failed:
+            self._invalidate_alerts("synchronisation failed (" + "; ".join(failed) + ")",
+                                    roles=("stock", "bom") if db_error else (), read_failure=bool(db_error))
+        elif results and self.sources_verified():
+            self.request_alerts("sync")
+
+    def preview_upgrade(self):
+        """Explicit upgrade to the alert schema: read-only preview, No-default consent, backed-up guarded worker."""
+        if self.busy or self.inventory is None or self._alerts_running("Database upgrade"):
+            return
+        database = self.inventory.db_path
+
+        def done(backup):
+            self.maintenance_message = "Local database upgraded"
+            self._invalidate_alerts("the local database was upgraded")
+            messagebox.showinfo("Database upgrade", "Local database upgraded.\nRecovery backup: " + backup +
+                                "\n\nThe current Excel files will now be read again (thresholds are captured if they "
+                                "were not stored yet); until then alerts are not re-checked.", parent=self.root)
+            self._load_alert_status()
+            if self.stock_path.get() or self.bom_path.get():
+                self.root.after_idle(self.refresh_excel)
+
+        def offer(plan):
+            self.maintenance_message = "Database upgrade preview only; nothing changed"
+            job = self.job
+            answer = messagebox.askyesno("Upgrade local database?", plan.describe() +
+                                         "\n\nCreate a backup and upgrade the local database now?",
+                                         parent=self.root, default="no")
+            if not answer or self.closed or self.busy or job != self.job:
+                return
+            self._start(lambda: upgrade.apply(plan, self.cancelled), done, "升级数据库")
+        self._start(lambda: upgrade.preview(database), offer, "预览数据库升级")
 
     def use_cached_data(self):
         """Read-only preview on a worker; only an affirmative, current dialog enables historical mode."""
@@ -807,6 +1069,8 @@ class CheckerApp:
         if sync:
             self.sync_active = {role: CHECKING for role, path in sync[0].items() if path}
             self._render_inventory()
+            self._invalidate_alerts("the Excel files are being checked again",
+                                    roles=tuple(role for role, path in sync[0].items() if path))
         def worker():
             started = time.perf_counter()
             for attempt in range(1, (binding.CHECK_ATTEMPTS if verify else 1) + 1):
@@ -831,6 +1095,7 @@ class CheckerApp:
     def _poll(self):
         if self.closed:
             return
+        self._drain_alert_events()
         while True:  # progress of a running sync (worker thread → queue → here, the Tk thread)
             try:
                 job, role, state = self.inventory_events.get_nowait()
@@ -849,6 +1114,7 @@ class CheckerApp:
                 return
             self._set_busy(False)
             sync_note = self._show_inventory(report) if report is not None else ""
+            self._note_sync(report)
             # Every outcome, failures included, shows the current database state (and its cloud limitation).
             db_suffix = (f" · Inventory Database: {status_text(self.db_overall)}"
                          if report is not None and self.db_panel is not None else "")
@@ -857,11 +1123,16 @@ class CheckerApp:
                     self.inventory_roles = {}
                     self.inventory_read_error = str(error)
                     self._render_inventory()
+                    self.alert_read_failed(error)
                     if self.cache_selection is not None:
                         self.cache_authorized = False
                         self.mode_label.configure(text=cached.LABEL + ' · Reselect required', foreground='#b00020')
                 self.status.set('Local history maintenance refused/failed · ' + CLOUD_NOT_VERIFIED)
                 messagebox.showerror('Local History', str(error), parent=self.root)
+            elif isinstance(error, upgrade.UpgradeError):
+                # Refused or rolled back: the database stays schema 1 and every loaded file stays as it was.
+                self.status.set('Database upgrade refused/failed; nothing changed · ' + CLOUD_NOT_VERIFIED)
+                messagebox.showerror('Database upgrade', str(error), parent=self.root)
             elif error is not None:
                 if isinstance(error, cached.CacheError) and self.cache_selection is not None:
                     self.cache_authorized = False
@@ -870,6 +1141,7 @@ class CheckerApp:
                     self.inventory_roles = {}
                     self.inventory_read_error = str(error)
                     self._render_inventory()
+                    self.alert_read_failed(error)
                     db_suffix = f" · Inventory Database: {status_text(self.db_overall)}"
                 # Unexpected failure of the whole action: nothing loaded can be trusted, so clear everything.
                 for role in ROLES:
@@ -891,7 +1163,7 @@ class CheckerApp:
                     self.status.set("Read / check failed · Click the file card for details." + db_suffix)
                     messagebox.showerror("读取/检查失败", "\n\n".join(x for x in (problem, sync_note) if x), parent=self.root)
                 else:
-                    if label in ('预览历史清理', '清理历史数据'):
+                    if label in MAINTENANCE_JOBS:
                         status = self.maintenance_message + ' · ' + CLOUD_NOT_VERIFIED
                     elif self.cache_selection is not None:
                         status = cached.LABEL + " · Cloud Not Verified · Historical data only"
@@ -1230,6 +1502,7 @@ class CheckerApp:
             self.inventory_roles = {}
             self.inventory_read_error = str(exc)
             self._render_inventory()
+            self.alert_read_failed(exc)
         if not self.summary.get().startswith(binding.OUTDATED):
             self.summary.set(binding.OUTDATED + '\n' + self.summary.get())
         detail = '\n'.join(x for x in (str(exc), getattr(exc, 'cleanup_warning', '')) if x)
@@ -1275,6 +1548,12 @@ class CheckerApp:
     def close(self):
         self.closed = True
         self.cancelled.set()
+        if self.history_window is not None:
+            self.history_window.close()
+        if self.alert_runner is not None:
+            self.alert_runner.close()  # a running evaluation finishes its transaction; nothing is delivered
+        if self.alerts_window is not None:
+            self.alerts_window.close()
         self.root.after_cancel(self.poll_id)
         if self._resize_job is not None:
             self.root.after_cancel(self._resize_job)

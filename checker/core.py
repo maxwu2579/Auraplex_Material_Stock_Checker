@@ -78,6 +78,10 @@ class Material:
     rack: Any = None
     level: Any = None
     section: str = ""
+    # M3.2C: raw minimum-stock candidate (MIN QTY / MIIN QTY column) exactly as read, with its cell type. Not used by
+    # check_materials; the M2 calculation and classification ignore it.
+    threshold: Any = None
+    threshold_type: str = ""
 
 
 def material_key(material: Material) -> str:
@@ -98,6 +102,12 @@ class StockSheet:
     name: str
     header_row: int
     materials: tuple[Material, ...]
+    # M3.2C threshold column of this Sheet: FOUND (exactly one MIN QTY / MIIN QTY header), NOT_FOUND, AMBIGUOUS
+    # (several candidates: none is chosen) or NOT_CAPTURED (a database version imported before thresholds existed).
+    threshold_state: str = "NOT_FOUND"
+    threshold_column: str | None = None    # column letter, e.g. "P"
+    threshold_header: str | None = None    # original header text, spelling unchanged (e.g. "MIIN QTY")
+    threshold_candidates: tuple = ()       # ((column letter, original header), ...) when AMBIGUOUS
 
 
 @dataclass(frozen=True)

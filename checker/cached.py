@@ -12,7 +12,7 @@ from openpyxl.comments import Comment
 from openpyxl.styles import Alignment, Font
 
 from .core import WorkbookData, ROW_CAVEAT
-from .inventory_db import SCHEMA_VERSION
+from .inventory_db import SUPPORTED_SCHEMA_VERSIONS
 from .queries import open_readonly, current_version, load_workbook_data
 from . import report
 
@@ -92,7 +92,7 @@ def load(database) -> Snapshot:
         conn = open_readonly(path)
         conn.execute('PRAGMA busy_timeout = 1500')
         conn.execute('BEGIN')
-        if conn.execute('PRAGMA user_version').fetchone()[0] != SCHEMA_VERSION:
+        if conn.execute('PRAGMA user_version').fetchone()[0] not in SUPPORTED_SCHEMA_VERSIONS:
             raise CacheReadError('Unsupported cache database schema; historical calculation refused.')
         versions, books = [], {}
         for role in ('stock', 'bom'):
