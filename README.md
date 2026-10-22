@@ -185,7 +185,17 @@ Click **Daily Summary…** (beside the *Stock Alerts* line, top right) to open a
 
 Generation and saving run in the background, one at a time with at most one waiting request; the newest request always wins, an older result never replaces it, a failed generation clears the preview, and closing the window discards pending results. A database read failure is handled like other alert reads: this session's verification is discarded until Refresh Excel. Preview lists show 200 rows each; the saved files hold up to 5,000 alerts and 2,000 observed changes, with totals always counted.
 
-## Unattended daily run and schedule draft (M3.2E E1, in development)
+## Inventory analytics (M4B, source reviewed and committed locally)
+
+Click **Analytics…** beside Daily Summary to open the independent historical analysis window. Choose 30/60/90 days, an optional exact Storage Sheet, and/or a partial Material ID. Every source file / original Sheet / exact Material ID remains a separate group. Results always say **HISTORICAL / UNVERIFIED · Not current stock · Cloud Not Verified**, with last-observed timestamps and selectable raw source/version/row/Rack/Level details. This reads retained SQLite snapshots only; it does not load Excel or call an AI provider.
+
+The displayed, adjustable heuristics default to a minimum 30-day observed span, low cumulative absolute change of 0, and a large single change of at least 50% of the previous positive value. Positive stock whose trailing observations remain equal across the minimum span is a **human-review candidate**; it is not confirmed excess stock or low importance. A recent change ends that trailing-unchanged cue. No consumption, reorder amount, demand forecast or days-of-stock estimate is calculated. Existing MIN QTY stock-alert rules remain in Stock Alerts.
+
+Movement is the sum of absolute differences over comparable adjacent snapshot intervals only. Net change is withheld across missing/invalid/duplicate records, missing payloads, pruned history or source interruptions. Missing material records are ABSENT, not 0; missing retained payloads are unknown. Zero-to-positive changes have no percentage. A labelled before-window reference may be included; snapshot dates describe when values were imported, not when actual movements occurred. No new snapshot does not prove unchanged physical stock.
+
+One query runs at a time with at most one replaceable waiting query. Stop or changing filters discards old results. Database failures clear results and invalidate alert verification through the existing failure handler; Refresh Excel is required to re-verify. Results render 200 groups at a time. Queries have a five-second processing budget and refuse, without partial results, more than 400 in-window snapshots, 200,000 historical rows (including reference) or 5,000 source/Sheet/material groups. The row cap counts complete source versions even with a material filter; choose a shorter period when it is exceeded. The version-count and row limits protect memory and limit read-lock duration; filesystem/SQLite lock waits can add latency. No database migration or dependency installation is needed. A P2 follow-up remains for detecting inconsistent Sheet metadata in a damaged SQLite database. Packaged M4B, real Drive, another PC and physical-DPI acceptance remain pending.
+
+## Unattended daily run and schedule draft (M3.2E E1)
 
 Open **Daily Summary… → Schedule draft…** to choose an existing output folder and local daily time. The default-No confirmation explains the constraints, then exports a new Task Scheduler XML file. **This does not register, enable or change a Windows task.** Existing XML files are not overwritten. Actual task activation is a separate user decision and acceptance step.
 

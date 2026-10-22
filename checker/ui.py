@@ -20,6 +20,7 @@ from .sync import (CHECKING, CLOUD_NOT_VERIFIED, DATABASE_UNAVAILABLE, LOCAL_VER
 from .report import ReportError, default_filename, save_verified_report
 from .service import CheckerService
 from .history_ui import HistoryWindow
+from .analytics_ui import AnalyticsWindow
 from .alerts_ui import AlertsWindow
 from .daily_ui import DailySummaryWindow
 from .presentation import BG, INK, MUTED, BLUE, RED, AMBER, Tooltip, ellipsize, work_area
@@ -66,6 +67,7 @@ class CheckerApp:
         self.stock_book = self.bom_book = self.result = None
         self.result_binding = None # binding.SourceBinding of the shown result: which source versions it belongs to
         self.history_window = None   # M4A Inventory History window (read-only), at most one
+        self.analytics_window = None  # M4B historical analytics, read-only and bounded
         # M3.2C stock alerts: one evaluation at a time (+1 pending), evaluated after both files verified this session.
         self.alert_gate = alerts.SessionGate()  # invalidated on every selection / sync / failure / read failure
         self.alert_runner = (alerts.AlertRunner(alerts.AlertService(inventory.db_path), self.alert_gate)
@@ -199,6 +201,10 @@ class CheckerApp:
                                         foreground=BLUE, cursor="hand2")
             self.daily_link.pack(side="right", padx=(0, 16))
             self.daily_link.bind("<Button-1>", lambda _e: self.open_daily())
+            self.analytics_link = ttk.Label(links, text="Analytics…", font=("Segoe UI", 9, "underline"),
+                                            foreground=BLUE, cursor="hand2")
+            self.analytics_link.pack(side="right", padx=(0, 16))
+            self.analytics_link.bind("<Button-1>", lambda _e: self.open_analytics())
             Tooltip(self.daily_link, lambda: "Daily Stock Summary (M3.2D): generate, preview and save a read-only "
                     "HTML + JSON summary of one day. Cloud Not Verified.")
         ttk.Label(heading, text="Material Requirement & Stock Checker", style="Title.TLabel").pack(anchor="w")
@@ -615,6 +621,19 @@ class CheckerApp:
             if self.history_window is window:
                 self.history_window = None
         self.history_window = HistoryWindow(self.root, self.inventory.db_path, on_close=closed)
+
+    def open_analytics(self):
+        if self.inventory is None:
+            messagebox.showerror('Inventory Analytics', 'A readable local database is required.', parent=self.root)
+            return
+        if self.analytics_window is not None and not self.analytics_window.closed:
+            self.analytics_window.lift()
+            return
+        def closed(window):
+            if self.analytics_window is window:
+                self.analytics_window = None
+        self.analytics_window = AnalyticsWindow(self.root, self.inventory.db_path, on_close=closed,
+                                                on_read_error=self.alert_read_failed)
 
     def open_daily(self):
         """M3.2D: open (or bring forward) the Daily Stock Summary window. It only reads the database."""
@@ -1579,6 +1598,8 @@ class CheckerApp:
         self.cancelled.set()
         if self.history_window is not None:
             self.history_window.close()
+        if self.analytics_window is not None:
+            self.analytics_window.close()
         if self.alert_runner is not None:
             self.alert_runner.close()  # a running evaluation finishes its transaction; nothing is delivered
         if self.alerts_window is not None:
