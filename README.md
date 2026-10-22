@@ -16,6 +16,12 @@ The application is not digitally signed, so Windows may show a "Windows protecte
 
 ## Features
 
+Development source now includes M4C controlled read-only inventory tools and a provider-independent Agent core
+(source reviewed; not in v1.0.0). It has no live AI connection or chat window yet. Data access requires explicit
+session-only historical-cache authorization and always returns UNVERIFIED / Cloud Not Verified evidence. See
+`M4C_IMPLEMENTATION_REPORT.md`, `M4C_TEST_REPORT.md` and `M4C_CODEX_REVIEW.md`; two P2 performance follow-ups are
+recorded. Provider integration and the three-language robot UI are later M4D/M4E milestones.
+
 - Product ID search (type part of an ID, pick from the list)
 - Production quantity calculation
 - BOM vs Storage comparison
@@ -193,7 +199,7 @@ The displayed, adjustable heuristics default to a minimum 30-day observed span, 
 
 Movement is the sum of absolute differences over comparable adjacent snapshot intervals only. Net change is withheld across missing/invalid/duplicate records, missing payloads, pruned history or source interruptions. Missing material records are ABSENT, not 0; missing retained payloads are unknown. Zero-to-positive changes have no percentage. A labelled before-window reference may be included; snapshot dates describe when values were imported, not when actual movements occurred. No new snapshot does not prove unchanged physical stock.
 
-One query runs at a time with at most one replaceable waiting query. Stop or changing filters discards old results. Database failures clear results and invalidate alert verification through the existing failure handler; Refresh Excel is required to re-verify. Results render 200 groups at a time. Queries have a five-second processing budget and refuse, without partial results, more than 400 in-window snapshots, 200,000 historical rows (including reference) or 5,000 source/Sheet/material groups. The row cap counts complete source versions even with a material filter; choose a shorter period when it is exceeded. The version-count and row limits protect memory and limit read-lock duration; filesystem/SQLite lock waits can add latency. No database migration or dependency installation is needed. A P2 follow-up remains for detecting inconsistent Sheet metadata in a damaged SQLite database. Packaged M4B, real Drive, another PC and physical-DPI acceptance remain pending.
+One query runs at a time with at most one replaceable waiting query. Stop or changing filters discards old results. Database failures clear results and invalidate alert verification through the existing failure handler; Refresh Excel is required to re-verify. Results render 200 groups at a time. Queries have a five-second processing budget and refuse, without partial results, more than 400 in-window snapshots, 200,000 historical rows (including reference) or 5,000 source/Sheet/material groups. The row cap counts complete source versions even with a material filter; choose a shorter period when it is exceeded. The version-count and row limits protect memory and limit read-lock duration; filesystem/SQLite lock waits can add latency. No database migration or dependency installation is needed. The P2 Sheet-metadata integrity follow-up is implemented with M4C and has synthetic regressions, pending separate review. Packaged M4B, real Drive, another PC and physical-DPI acceptance remain pending.
 
 ## Unattended daily run and schedule draft (M3.2E E1)
 

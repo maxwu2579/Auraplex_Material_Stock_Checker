@@ -6,6 +6,7 @@ Absence, duplicates, missing payloads and source switches break comparability, n
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import timedelta
 from decimal import Decimal, InvalidOperation, localcontext
@@ -110,7 +111,8 @@ def _checkpoint(stage):
 
 
 def analyze(database, days=30, sheet=None, material_text='', *, now=None, policy=None, cancel=None,
-            max_snapshots=MAX_SNAPSHOTS, max_rows=MAX_ROWS, max_groups=MAX_GROUPS, budget_seconds=5):
+            max_snapshots=MAX_SNAPSHOTS, max_rows=MAX_ROWS, max_groups=MAX_GROUPS, budget_seconds=5,
+            connection=None):
     """One consistent bounded read view. No file reads, sync, migrations, writes or extrapolation to today.
 
     Includes the last global snapshot before the window as a labelled reference. Deltas involving it are observed
@@ -134,7 +136,7 @@ def analyze(database, days=30, sheet=None, material_text='', *, now=None, policy
         if time.monotonic() >= deadline:
             raise AnalyticsLimit('Analysis time limit reached. Choose a shorter range or narrower filter.')
 
-    with read_view(database) as conn, localcontext() as context:
+    with (nullcontext(connection) if connection is not None else read_view(database)) as conn, localcontext() as context:
         # Native Excel quantities span binary64 values; avoid default-28-digit rounding of their stored decimals.
         context.prec = 2048
         conn.set_progress_handler(lambda: int((cancel is not None and cancel.is_set()) or
@@ -156,12 +158,25 @@ def analyze(database, days=30, sheet=None, material_text='', *, now=None, policy
             payloads, groups, sheets, unkeyed = [], set(), set(), 0
             for snap in snaps:
                 check()
-                version = conn.execute('SELECT source_path, record_count FROM source_versions WHERE id=?',
+                version = conn.execute('SELECT source_path, role, record_count, sheet_count FROM source_versions WHERE id=?',
                                        (snap['source_version_id'],)).fetchone()
                 if version is None:
                     raise HistoryReadError('Snapshot source metadata is missing.')
+                if version['role'] != 'stock':
+                    raise HistoryReadError('Snapshot does not belong to a Storage version.')
+                sheet_count = conn.execute('SELECT count(*) FROM stock_sheets WHERE source_version_id=?',
+                                           (snap['source_version_id'],)).fetchone()[0]
+                foreign_rows = conn.execute(
+                    'SELECT (SELECT count(*) FROM stock_records r LEFT JOIN stock_sheets s ON s.id=r.stock_sheet_id'
+                    ' WHERE r.source_version_id=? AND (s.id IS NULL OR s.source_version_id!=r.source_version_id))'
+                    ' + (SELECT count(*) FROM stock_sheets s JOIN stock_records r ON r.stock_sheet_id=s.id'
+                    ' WHERE s.source_version_id=? AND r.source_version_id!=s.source_version_id)',
+                    (snap['source_version_id'], snap['source_version_id'])).fetchone()[0]
                 count = conn.execute('SELECT count(*) FROM stock_records WHERE source_version_id=?',
                                      (snap['source_version_id'],)).fetchone()[0]
+                # Retention may remove an entire old payload; it stays explicitly NOT_RETAINED.
+                if foreign_rows or ((count or sheet_count) and sheet_count != version['sheet_count']):
+                    raise HistoryReadError('Snapshot Sheet metadata is inconsistent; analysis refused.')
                 complete = count == version['record_count'] == snap['record_count']
                 selected = {}
                 for s in conn.execute('SELECT sheet_name FROM stock_sheets WHERE source_version_id=?',

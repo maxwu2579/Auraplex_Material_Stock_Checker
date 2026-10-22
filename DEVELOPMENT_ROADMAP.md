@@ -30,8 +30,8 @@ M3 uses deterministic Python logic, without a model API. MIN QTY fields, units a
 | Milestone | Scope | Status |
 | --- | --- | --- |
 | M4A | Material/Sheet history query and 30/60/90-day observed stock changes | Completed and accepted (source); committed locally with M3.2C. P2 worker fan-out follow-up recorded |
-| M4B | Low observed movement, long unchanged periods, possible excess inventory, unusual fluctuations and stock risk | Source reviewed and committed locally. Focused tests and read-only desktop workbook smoke check passed. One P2 SQLite Sheet-metadata integrity follow-up remains; EXE, real Drive, other-PC and physical-DPI acceptance pending |
-| M4C | Agent loop, tool calling, controlled read-only query tools, structured results and errors | Planned |
+| M4B | Low observed movement, long unchanged periods, possible excess inventory, unusual fluctuations and stock risk | Source reviewed and committed locally (`547039d`). Sheet-metadata integrity follow-up implemented and reviewed with M4C; EXE, real Drive, other-PC and physical-DPI acceptance pending |
+| M4C | Agent loop, tool calling, controlled read-only query tools, structured results and errors | Source reviewed; GO for local commit. 105 focused checks passed. Two P2 query-budget/history-scan follow-ups recorded in `M4C_CODEX_REVIEW.md`. Nine allowlisted tools, session-only explicit historical consent, UNVERIFIED evidence. No live provider or chat UI |
 | M4D | Default DeepSeek provider with replaceable provider interface; future OpenAI, Gemini and local AI server adapters | Planned |
 | M4E | Bottom-right robot launcher, inventory assistant/chat, three-language response routing, evidence and freshness presentation | Planned; requirements below |
 | M4F | AI daily/weekly narratives, trend explanations, purchasing-review suggestions and email notifications | Planned |

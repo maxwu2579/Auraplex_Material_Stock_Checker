@@ -10,7 +10,7 @@ are counted so the UI can say what was not loaded. The database is never created
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import json
@@ -194,10 +194,11 @@ def _raw_list(text):
 
 def material_history(database, material_key: str, days: int, sheet: str | None = None,
                      now: datetime | None = None, max_rows: int = MAX_RECORDS,
-                     max_changes: int = MAX_CHANGES) -> HistoryResult:
+                     max_changes: int = MAX_CHANGES, *, connection=None) -> HistoryResult:
     """Records and observed changes of exactly one Material ID over the last `days` days, newest first.
 
-    `sheet=None` lists every Sheet, each row labelled with its own Sheet; values are never combined."""
+    `sheet=None` lists every Sheet, each row labelled with its own Sheet; values are never combined.
+    Internal callers may supply an already validated read_view connection to share its snapshot/limits."""
     if days not in RANGES:
         raise HistoryError(f"Unsupported range: {days} days")
     key = normalize_code(material_key)
@@ -206,7 +207,7 @@ def material_history(database, material_key: str, days: int, sheet: str | None =
     end = now or utc_now()
     start = end - timedelta(days=days)
     start_s, end_s = stamp(start), stamp(end)
-    with read_view(database) as conn:
+    with (nullcontext(connection) if connection is not None else read_view(database)) as conn:
         window = snapshots(conn, start, end)
         reference = conn.execute("SELECT * FROM inventory_snapshots WHERE observed_at < ? ORDER BY observed_at DESC,"
                                  " id DESC LIMIT 1", (start_s,)).fetchone()
