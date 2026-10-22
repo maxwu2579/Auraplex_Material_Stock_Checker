@@ -13,7 +13,7 @@ from tkinter import font as tkfont
 
 from .core import (DataReadError, ENOUGH, EXCEPTION, ROW_CAVEAT, SHORTAGE, check_materials, display,
                    production_quantity, search_products, select_product)
-from . import alerts, binding, cached, retention, upgrade
+from . import alerts, binding, cached, daily, retention, upgrade
 from .queries import overall_state, overall_times, status_text, with_known_failures
 from .sync import (CHECKING, CLOUD_NOT_VERIFIED, DATABASE_UNAVAILABLE, LOCAL_VERIFIED, NOT_SYNCED, SOURCE_CHANGED,
                    SOURCE_UNAVAILABLE, STATUS_UNKNOWN, SYNC_FAILED, USING_PREVIOUS)
@@ -21,6 +21,7 @@ from .report import ReportError, default_filename, save_verified_report
 from .service import CheckerService
 from .history_ui import HistoryWindow
 from .alerts_ui import AlertsWindow
+from .daily_ui import DailySummaryWindow
 from .presentation import BG, INK, MUTED, BLUE, RED, AMBER, Tooltip, ellipsize, work_area
 
 
@@ -70,6 +71,7 @@ class CheckerApp:
         self.alert_runner = (alerts.AlertRunner(alerts.AlertService(inventory.db_path), self.alert_gate)
                              if inventory is not None else None)
         self.alerts_window = None
+        self.daily_window = None     # M3.2D Daily Stock Summary window, at most one
         self.verified_roles = set()  # roles whose latest sync in this session verified the local file
         self.alert_sources = {}      # role -> (version ID, selected path) of that verification
         self.alert_status_events = queue.Queue()
@@ -182,13 +184,23 @@ class CheckerApp:
             self.history_button.pack(side="right", padx=(8, 0))
             # M3.2C: alert count of the last verified evaluation, under the buttons (uses the title's height; the
             # Inventory Database panel and the CHECK row are unchanged). Click opens Stock Alerts.
-            self.alerts_label = ttk.Label(actions, text=self.alert_text, font=("Segoe UI", 9, "underline"),
+            links = ttk.Frame(actions)
+            links.pack(anchor="e", pady=(3, 0))
+            self.alerts_label = ttk.Label(links, text=self.alert_text, font=("Segoe UI", 9, "underline"),
                                           foreground="#95641a", cursor="hand2")
-            self.alerts_label.pack(anchor="e", pady=(3, 0))
+            self.alerts_label.pack(side="right")
             self.alerts_label.bind("<Button-1>", lambda _e: self.open_alerts())
             Tooltip(self.alerts_label, lambda: "Stock Alerts (M3.2C) from synchronised Excel data. Thresholds and "
                     "units pending business confirmation. Cloud Not Verified. Click to open." +
                     ("" if self.alert_current else f"\nNot re-checked: {self.alert_reason}"))
+            # M3.2D: manual daily summary (read-only preview, HTML + JSON on request); never part of CHECK or export.
+            # A link beside the alert line, so the button row (and the title beside it) keeps its width.
+            self.daily_link = ttk.Label(links, text="Daily Summary…", font=("Segoe UI", 9, "underline"),
+                                        foreground=BLUE, cursor="hand2")
+            self.daily_link.pack(side="right", padx=(0, 16))
+            self.daily_link.bind("<Button-1>", lambda _e: self.open_daily())
+            Tooltip(self.daily_link, lambda: "Daily Stock Summary (M3.2D): generate, preview and save a read-only "
+                    "HTML + JSON summary of one day. Cloud Not Verified.")
         ttk.Label(heading, text="Material Requirement & Stock Checker", style="Title.TLabel").pack(anchor="w")
         ttk.Label(heading, text="Check material requirements against current stock.", style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
         files = ttk.Frame(self.overview_content)
@@ -603,6 +615,23 @@ class CheckerApp:
             if self.history_window is window:
                 self.history_window = None
         self.history_window = HistoryWindow(self.root, self.inventory.db_path, on_close=closed)
+
+    def open_daily(self):
+        """M3.2D: open (or bring forward) the Daily Stock Summary window. It only reads the database."""
+        if self.alert_runner is None:
+            messagebox.showerror("Daily Stock Summary", "A readable local database is required.", parent=self.root)
+            return
+        if self.daily_window is not None and not self.daily_window.closed:
+            self.daily_window.lift()
+            return
+        self.daily_window = DailySummaryWindow(self.root, self)
+
+    def daily_session(self):
+        """What this session has verified right now (Tk thread): the gate generation, the Authorization of both files,
+        and whether a verified alert evaluation of that generation was confirmed."""
+        authorization = self.alert_authorization()
+        return daily.Session(self.alert_gate.generation, authorization,
+                             bool(self.alert_current and authorization is not None), self.alert_reason)
 
     # ------------------------------------------------------------------ M3.2C stock alerts
     # The entry line and the window combine two things: the alerts stored in the database (counts, history) and
@@ -1554,6 +1583,8 @@ class CheckerApp:
             self.alert_runner.close()  # a running evaluation finishes its transaction; nothing is delivered
         if self.alerts_window is not None:
             self.alerts_window.close()
+        if self.daily_window is not None:
+            self.daily_window.close()
         self.root.after_cancel(self.poll_id)
         if self._resize_job is not None:
             self.root.after_cancel(self._resize_job)

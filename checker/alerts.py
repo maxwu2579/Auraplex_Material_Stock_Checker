@@ -576,38 +576,43 @@ def _evaluation(row):
 def load_state(database, include_resolved=False, include_other_sources=True, limit=MAX_LOADED_ALERTS) -> AlertState:
     """Read-only, one consistent view. Below schema 3: an empty state saying an upgrade is required."""
     with read_view(database) as conn:
-        version = schema_version(conn)
-        if version < ALERT_SCHEMA_VERSION:
-            return AlertState(version, None, None, None, None, None, None, {}, 0, (), 0)
-        stock, bom = current_version(conn, "stock"), current_version(conn, "bom")
-        storage = source_identity(stock["source_path"]) if stock else None
-        bom_scope = source_identity(bom["source_path"]) if bom else None
-        scope = (storage, bom_scope)
-        latest = _evaluation(conn.execute("SELECT * FROM alert_evaluations ORDER BY id DESC LIMIT 1").fetchone())
-        completed = _evaluation(conn.execute(
-            "SELECT * FROM alert_evaluations WHERE outcome = 'COMPLETED' AND storage_source IS ? AND bom_source IS ?"
-            " ORDER BY id DESC LIMIT 1", scope).fetchone())
-        counts = {r[0]: r[1] for r in conn.execute(
-            "SELECT alert_type, count(*) FROM stock_alerts WHERE status = 'ACTIVE' AND " + _in_scope_sql() +
-            " GROUP BY alert_type", scope)}
-        others = conn.execute("SELECT count(*) FROM stock_alerts WHERE status = 'ACTIVE' AND NOT " + _in_scope_sql(),
-                              scope).fetchone()[0]
-        conditions = [] if include_resolved else ["status = 'ACTIVE'"]
-        args = []
-        if not include_other_sources:
-            conditions.append(_in_scope_sql())
-            args.extend(scope)
-        where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
-        total = conn.execute("SELECT count(*) FROM stock_alerts" + where, args).fetchone()[0]
-        order = " ".join(f"WHEN '{t}' THEN {i}" for i, t in enumerate(TYPES))
-        rows = tuple(AlertRow(r["alert_type"], r["subtype"], r["stock_sheet"], r["material_key"], r["status"],
-                              r["first_seen_at"], r["last_seen_at"], r["resolved_at"], r["stock_version_id"],
-                              r["bom_version_id"], r["storage_source"], r["bom_source"], bool(r["in_scope"]),
-                              json.loads(r["detail"]))
-                     for r in conn.execute(f"SELECT *, {_in_scope_sql()} AS in_scope FROM stock_alerts{where}"
-                                           f" ORDER BY status = 'RESOLVED', in_scope DESC,"
-                                           f" CASE alert_type {order} END, stock_sheet, subtype, material_key, id"
-                                           f" LIMIT ?", (*scope, *args, limit)))
+        return state_in(conn, include_resolved, include_other_sources, limit)
+
+
+def state_in(conn, include_resolved=False, include_other_sources=True, limit=MAX_LOADED_ALERTS) -> AlertState:
+    """load_state inside the caller's read transaction (so other reads can share the same database state)."""
+    version = schema_version(conn)
+    if version < ALERT_SCHEMA_VERSION:
+        return AlertState(version, None, None, None, None, None, None, {}, 0, (), 0)
+    stock, bom = current_version(conn, "stock"), current_version(conn, "bom")
+    storage = source_identity(stock["source_path"]) if stock else None
+    bom_scope = source_identity(bom["source_path"]) if bom else None
+    scope = (storage, bom_scope)
+    latest = _evaluation(conn.execute("SELECT * FROM alert_evaluations ORDER BY id DESC LIMIT 1").fetchone())
+    completed = _evaluation(conn.execute(
+        "SELECT * FROM alert_evaluations WHERE outcome = 'COMPLETED' AND storage_source IS ? AND bom_source IS ?"
+        " ORDER BY id DESC LIMIT 1", scope).fetchone())
+    counts = {r[0]: r[1] for r in conn.execute(
+        "SELECT alert_type, count(*) FROM stock_alerts WHERE status = 'ACTIVE' AND " + _in_scope_sql() +
+        " GROUP BY alert_type", scope)}
+    others = conn.execute("SELECT count(*) FROM stock_alerts WHERE status = 'ACTIVE' AND NOT " + _in_scope_sql(),
+                          scope).fetchone()[0]
+    conditions = [] if include_resolved else ["status = 'ACTIVE'"]
+    args = []
+    if not include_other_sources:
+        conditions.append(_in_scope_sql())
+        args.extend(scope)
+    where = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+    total = conn.execute("SELECT count(*) FROM stock_alerts" + where, args).fetchone()[0]
+    order = " ".join(f"WHEN '{t}' THEN {i}" for i, t in enumerate(TYPES))
+    rows = tuple(AlertRow(r["alert_type"], r["subtype"], r["stock_sheet"], r["material_key"], r["status"],
+                          r["first_seen_at"], r["last_seen_at"], r["resolved_at"], r["stock_version_id"],
+                          r["bom_version_id"], r["storage_source"], r["bom_source"], bool(r["in_scope"]),
+                          json.loads(r["detail"]))
+                 for r in conn.execute(f"SELECT *, {_in_scope_sql()} AS in_scope FROM stock_alerts{where}"
+                                       f" ORDER BY status = 'RESOLVED', in_scope DESC,"
+                                       f" CASE alert_type {order} END, stock_sheet, subtype, material_key, id"
+                                       f" LIMIT ?", (*scope, *args, limit)))
     return AlertState(version, storage, bom_scope, stock["source_path"] if stock else None,
                       bom["source_path"] if bom else None, latest, completed, counts, others, rows, total)
 

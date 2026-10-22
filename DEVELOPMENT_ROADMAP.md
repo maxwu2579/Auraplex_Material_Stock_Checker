@@ -1,6 +1,6 @@
 # Auraplex Material Stock Checker — Development Roadmap
 
-Updated: 2026-10-22. This document records the user's roadmap and agreed assistant UI/language requirements. Future milestones are plans, not claims of implementation or authorization to release. M4A and M3.2C passed Codex source acceptance (`M4A_CODEX_REVIEW.md`, `M3_2C_FINAL_CODEX_ACCEPTANCE.md`) and are committed locally; neither is released.
+Updated: 2026-10-22. This document records the user's roadmap and agreed assistant UI/language requirements. Future milestones are plans, not claims of implementation or authorization to release. M4A, M3.2C and M3.2D passed Codex source acceptance; M3.2D's final decision is in `M3_2D_FINAL_CODEX_ACCEPTANCE.md`. Their local commits do not constitute release approval.
 
 ## Phase 1 — Completed foundation
 
@@ -20,10 +20,10 @@ Updated: 2026-10-22. This document records the user's roadmap and agreed assista
 | M3.2A | Explicit offline cached calculations, always UNVERIFIED | Completed and accepted; local commit `d0633fd` |
 | M3.2B | Retention, cleanup preview, backup, rollback and historical-baseline protection | Completed and accepted; local commit `d0633fd` |
 | M3.2C | Automatic low-stock checks using valid MIN QTY, observed changes, data anomalies and alert deduplication | Completed and accepted (source); committed locally with M4A |
-| M3.2D | Daily summary of low stock, observed changes, data anomalies and sync state | Planned |
+| M3.2D | Daily summary of low stock, observed changes, data anomalies and sync state | Source acceptance passed; approved for local commit (manual generate/preview/save, HTML + JSON); not released |
 | M3.2E | Windows Task Scheduler, bounded retries, missed-run recovery and logs | Planned; deployment-dependent |
 
-M3 uses deterministic Python logic, without a model API. MIN QTY fields, units and threshold semantics must be verified before alerts are implemented. Missing/invalid thresholds mean “cannot assess”, not zero. Reports must expose sync failures and historical/unverified inputs. Scheduling reuses manual execution logic; a powered-on, available machine is necessary for unattended execution.
+M3 uses deterministic Python logic, without a model API. MIN QTY fields, units and threshold semantics must be verified before alerts are implemented. Missing/invalid thresholds mean “cannot assess”, not zero. Reports must expose sync failures and historical/unverified inputs. Scheduling reuses manual execution logic; a powered-on, available machine is necessary for unattended execution. M3.2E is meant to call the M3.2D service (`checker.daily.generate` / `save`) unchanged; a scheduled run has no interactive session, so its summaries are UNVERIFIED unless M3.2E defines and reviews its own verification step.
 
 ## Phase 3 — M4: Inventory Analytics & AI Agent
 
@@ -116,4 +116,4 @@ Also test turn-by-turn language switching, BOM/PCS/KG exclusions, ambiguous Mala
 
 Finish M4A → M3.2C → M3.2D → deployment-appropriate M3.2E → M4B → M4C/M4D → M4E → M4F → final delivery checks. M4E visual design may be prepared earlier without implying AI functionality is complete. M4G is optional.
 
-Claude Code performs primary implementation; Codex reviews completed milestones and key acceptance evidence. During development run affected checks, including data-safety checks when those paths change; consolidate regression and acceptance at milestone completion. Avoid repeated full-suite runs without new changes or failures. Report unexecuted environments honestly. Development completion, local commit, push and release are separate decisions; never automatically proceed to the next milestone or publication.
+Codex is taking primary implementation on 2026-10-22 at the user's request while Claude Code capacity is limited. Preserve a distinct review/acceptance gate before committing new milestones. During development run affected checks, including data-safety checks when those paths change; consolidate regression and acceptance at milestone completion. Avoid repeated full-suite runs without new changes or failures. Report unexecuted environments honestly. Development completion, local commit, push and release are separate decisions; never automatically proceed to the next milestone or publication.
