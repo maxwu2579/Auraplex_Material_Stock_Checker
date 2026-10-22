@@ -1,4 +1,4 @@
-"""M4C provider-independent, bounded tool-calling orchestration. No API/SDK/network integration.
+"""Provider-independent, bounded tool-calling orchestration.
 
 The final product of this phase is deterministic evidence, not unrestricted model prose. M4D/E must
 preserve this boundary: numbers/statuses come from evidence; workbook text is untrusted data.
@@ -42,6 +42,18 @@ class Provider(Protocol):
                  cancel: threading.Event) -> ModelReply:
         """Adapters must honor the remaining timeout/cancellation and never silently switch providers."""
         ...
+
+
+class ProviderFailure(Exception):
+    """Sanitized adapter failures. Arbitrary provider error text never reaches the host."""
+    CODES = frozenset({'OUTBOUND_CONSENT_REQUIRED', 'PROVIDER_AUTH_REQUIRED', 'PROVIDER_AUTH_FAILED',
+                       'PROVIDER_RATE_LIMITED', 'PROVIDER_QUOTA_EXHAUSTED', 'PROVIDER_UNAVAILABLE',
+                       'PROVIDER_TIMEOUT', 'PROVIDER_BUSY', 'PROVIDER_LIMIT', 'INVALID_PROVIDER_RESPONSE',
+                       'CANCELLED', 'OUTBOUND_DATA_REFUSED'})
+
+    def __init__(self, code):
+        self.code = code if code in self.CODES else 'PROVIDER_FAILED'
+        super().__init__(self.code)
 
 
 class Agent:
@@ -120,6 +132,8 @@ class Agent:
                 # Detached transport objects prevent an adapter mutating earlier host messages/evidence.
                 reply = self.provider.complete(json.loads(encoded(messages)), specifications(),
                                                timeout=max(.001, deadline-time.monotonic()), cancel=cancel)
+            except ProviderFailure as exc:
+                return self._result('FAILED', code=interrupted() or exc.code)
             except Exception:
                 return self._result('FAILED', code='PROVIDER_FAILED')
             error = interrupted()

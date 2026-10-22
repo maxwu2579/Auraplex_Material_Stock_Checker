@@ -31,8 +31,8 @@ M3 uses deterministic Python logic, without a model API. MIN QTY fields, units a
 | --- | --- | --- |
 | M4A | Material/Sheet history query and 30/60/90-day observed stock changes | Completed and accepted (source); committed locally with M3.2C. P2 worker fan-out follow-up recorded |
 | M4B | Low observed movement, long unchanged periods, possible excess inventory, unusual fluctuations and stock risk | Source reviewed and committed locally (`547039d`). Sheet-metadata integrity follow-up implemented and reviewed with M4C; EXE, real Drive, other-PC and physical-DPI acceptance pending |
-| M4C | Agent loop, tool calling, controlled read-only query tools, structured results and errors | Source reviewed; GO for local commit. 105 focused checks passed. Two P2 query-budget/history-scan follow-ups recorded in `M4C_CODEX_REVIEW.md`. Nine allowlisted tools, session-only explicit historical consent, UNVERIFIED evidence. No live provider or chat UI |
-| M4D | Default DeepSeek provider with replaceable provider interface; future OpenAI, Gemini and local AI server adapters | Planned |
+| M4C | Agent loop, tool calling, controlled read-only query tools, structured results and errors | Source reviewed and committed locally (`434357d`). Both P2 budget/history-scan fixes committed as `5b2e75f`; 73 M4C/M4B regressions passed. Nine allowlisted tools, explicit historical consent, UNVERIFIED evidence. No chat UI |
+| M4D | Default DeepSeek provider with replaceable provider interface; future OpenAI, Gemini and local AI server adapters | Source implemented; pending separate review/acceptance and local commit. 80 focused M4D/M4C checks passed. Minimal outbound projection, session consent, Windows vault, bounded HTTPS and deterministic quota notices. No real API, GUI integration or packaged acceptance |
 | M4E | Bottom-right robot launcher, inventory assistant/chat, three-language response routing, evidence and freshness presentation | Planned; requirements below |
 | M4F | AI daily/weekly narratives, trend explanations, purchasing-review suggestions and email notifications | Planned |
 | M4G | Optional company PDF/manual/purchasing-policy RAG using embeddings and vector search | Optional; not release-blocking |
@@ -53,6 +53,13 @@ Agreed requirements:
 8. Without an AI API, keep ordinary inventory search/statistics available and explain that chat interpretation is unavailable. Do not silently send information to another provider.
 9. Visual development can precede AI integration, but an unconnected panel must say it is not connected. No simulated stock answers presented as real tool results.
 10. Chat cannot modify source Excel, deduct stock, execute arbitrary SQL or place purchase orders. Email sending belongs to M4F and requires its own configured authorization.
+11. Show deterministic quota warnings inside chat: low currency balance, insufficient funds, unknown balance,
+    local session request limit and single-reply output limit. Use the selected Chinese/English/Malay reply
+    language, display balance observation time/staleness, and deduplicate repeated warnings. DeepSeek exposes
+    balance, not remaining Tokens: never invent a remaining-token percentage or confuse local limits with
+    account exhaustion. M4D supplies `quota_status()` / `take_notifications()` and configurable currency
+    thresholds; M4E must wire them to a visible status strip and assistant notices. After top-up, offer an
+    explicit recheck; account/balance access still requires outbound consent.
 
 ### M4E — Chinese, English and Malay replies
 

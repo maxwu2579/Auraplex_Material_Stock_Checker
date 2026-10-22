@@ -16,11 +16,12 @@ The application is not digitally signed, so Windows may show a "Windows protecte
 
 ## Features
 
-Development source now includes M4C controlled read-only inventory tools and a provider-independent Agent core
-(source reviewed; not in v1.0.0). It has no live AI connection or chat window yet. Data access requires explicit
-session-only historical-cache authorization and always returns UNVERIFIED / Cloud Not Verified evidence. See
-`M4C_IMPLEMENTATION_REPORT.md`, `M4C_TEST_REPORT.md` and `M4C_CODEX_REVIEW.md`; two P2 performance follow-ups are
-recorded. Provider integration and the three-language robot UI are later M4D/M4E milestones.
+Development source includes the reviewed M4C controlled read-only tools and Agent core, plus an M4D DeepSeek
+adapter awaiting separate review (neither is in v1.0.0). No real API was called. There is no chat/settings UI
+yet; that belongs to M4E. Data access requires session-only historical-cache authorization and returns
+UNVERIFIED / Cloud Not Verified evidence. External transmission requires a separate, explicit session consent.
+M4C's two P2 follow-ups are fixed in local commit `5b2e75f`; see `M4C_P2_REMEDIATION.md`.
+See `M4D_IMPLEMENTATION_REPORT.md` and `M4D_TEST_REPORT.md` for the adapter's scope and limits.
 
 - Product ID search (type part of an ID, pick from the list)
 - Production quantity calculation
@@ -222,6 +223,67 @@ Each process acquires a per-data-folder OS lock, checks both remembered Excel so
 Exit codes: `0` saved, `2` configuration/upgrade/journal-mode requirement, `3` sources not verified, `4` database/evaluation error, `5` generation/save/log error, `6` another run already owns the folder. `daily-runs.json` records UTC completion, code/reason, attempts/errors and any published report path; this feature keeps the latest 200 receipts plus the last success. It never prunes the inventory database. A corrupt receipt file is preserved and reported; if a report was already saved but logging fails, the failure outcome retains that report's path. `daily-run.lock` is an OS lock sentinel; its presence alone does not mean a run is active. A duplicate process returns code 6 without modifying the active run's log.
 
 Task Scheduler behavior references: [StartWhenAvailable](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-startwhenavailable-settingstype-element), [MultipleInstancesPolicy](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-multipleinstancespolicy-settingstype-element). Temporary actual timed recovery on attempt 2 and exhaustion after attempt 3 passed in source and packaged modes. Native automatic restart was not observed; its cause is retained for later CC investigation. See `M3_2E_SCHEDULER_VALIDATION.md`. Missed-run, clean-machine and other-PC acceptance remain unexecuted. No Email, AI, automatic task registration or company-PC deployment is included in E1.
+
+## AI provider adapter (M4D, source implementation awaiting review)
+
+`checker.providers.create_provider()` constructs the default DeepSeek adapter without accessing credentials
+or making a request. The existing Agent `Provider` protocol remains the replacement boundary; no other
+provider is silently selected. The adapter defaults to `deepseek-flash` with thinking disabled, using the
+official fixed HTTPS `/chat/completions` endpoint and normal function-call messages. Model availability
+has not been verified against a real account. Tools remain locally validated even when the model emits JSON.
+
+The future trusted host must display `provider.disclosure` and obtain consent to `provider.policy` before
+calling `authorize_outbound(policy=provider.policy, accepted=True)`. Declining or restarting leaves outbound
+access disabled. `revoke_outbound()` cancels the current outbound session. Cache consent is a separate
+requirement; a model cannot grant either consent. `preview(messages, tools)` returns the exact JSON body
+without accessing the key or network. No consent is saved in settings or SQLite.
+
+The `inventory-routing-v2` policy sends the question, fixed tools, candidate IDs/original Sheets and tool
+outcomes. Numerical evidence, descriptions, locations, full paths, hashes and database provenance remain
+local. The host renders numerical answers from the unchanged tool evidence. Full results are projected
+through a field allowlist; they are never sent wholesale. Common path/credential/email patterns in free text
+or identifiers refuse the request. This is not general secret detection: questions and candidate identifiers
+can themselves be company-sensitive. Approval of the actual outbound scope is required before live use.
+
+`checker.credentials.WindowsKeyStore` provides save/load/delete through the current user's Windows Credential
+Manager. It has no plaintext settings/file, environment-variable or command-line key fallback. M4E will
+provide the interactive key controls; no actual company key was read or stored during M4D. Other software
+running as the same Windows user can access the user's vault. Python/network buffers cannot guarantee that
+all in-memory key copies are erased.
+
+Defaults: ten attempted requests per consent session, 1,024 output tokens per request, 64 KiB request and
+256 KiB response limits. Failed attempts consume the request allowance. There are no automatic retries,
+redirects, environment proxies or provider switches. Errors distinguish missing/invalid keys, quota, rate
+limits, timeout, cancellation and malformed responses. These are resource limits, not a currency budget;
+already-sent requests may still incur charges after cancellation.
+
+Run on a host worker. HTTPS cancellation closes the socket, and late replies are discarded. OS DNS may
+outlive the caller timeout; the transport keeps its one-worker lock until DNS exits, refuses overlapping
+work and checks cancellation before sending. Reuse one adapter/transport in the host instead of creating
+one for every click. Stock CHECK, local tools and deterministic statistics do not require an AI provider.
+No API integration is wired into the current GUI or scheduled daily tasks; chat, language routing and AI
+notifications remain M4E/M4F. No real API, packaged EXE or second-PC validation has been performed for M4D.
+
+Account reminders: after outbound consent, the adapter also uses DeepSeek's fixed `GET /user/balance`
+endpoint before the first chat request, then at most once every five minutes during active use (including
+failed checks). This separate request sends the key, not inventory/question data. No timer/network job is
+started while idle. `request_balance_refresh()` makes the next authorized chat request recheck after a
+top-up; it does not reset the application's request allowance. Balance requests have a small separate
+share of the same overall caller time budget. A slow cancelled balance worker can temporarily leave the
+transport BUSY until cleanup; local tools remain usable.
+
+Low-balance thresholds default to USD 1.00 and CNY 5.00, independently configurable in ProviderConfig.
+Currencies are never added or converted. Provider-reported insufficient funds or HTTP 402 produces
+QUOTA_EXHAUSTED and refuses chat; failed/malformed checks produce QUOTA_UNKNOWN, never an invented zero
+or remaining-token percentage. These are labelled observations with a check time, not guarantees that
+the shared account balance stays unchanged. Failed rechecks invalidate older healthy observations.
+
+`quota_status()` is a local state read; `take_notifications()` drains deduplicated notices for the trusted
+chat host. Session requests nearing 80%/reaching the local cap and replies hitting their output limit have
+different codes from account exhaustion. Last-request Token usage is recorded only if the API supplies
+valid counts; it never represents Tokens remaining. Chinese/English/Malay notice templates are available
+in `checker.quota.notice_text`. M4E must show these notices and current balance-check state in the chat;
+this source milestone has no visible chatbot yet. Quota data is not sent back to the model or stored in SQLite.
 
 ## Safety
 
