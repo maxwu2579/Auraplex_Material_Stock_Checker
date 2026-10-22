@@ -23,6 +23,7 @@ from .history_ui import HistoryWindow
 from .analytics_ui import AnalyticsWindow
 from .alerts_ui import AlertsWindow
 from .daily_ui import DailySummaryWindow
+from .assistant_ui import AssistantLauncher
 from .presentation import BG, INK, MUTED, BLUE, RED, AMBER, Tooltip, ellipsize, work_area
 
 
@@ -68,6 +69,7 @@ class CheckerApp:
         self.result_binding = None # binding.SourceBinding of the shown result: which source versions it belongs to
         self.history_window = None   # M4A Inventory History window (read-only), at most one
         self.analytics_window = None  # M4B historical analytics, read-only and bounded
+        self.assistant = None  # M4E: isolated session, no credentials/network accessed at startup
         # M3.2C stock alerts: one evaluation at a time (+1 pending), evaluated after both files verified this session.
         self.alert_gate = alerts.SessionGate()  # invalidated on every selection / sync / failure / read failure
         self.alert_runner = (alerts.AlertRunner(alerts.AlertService(inventory.db_path), self.alert_gate)
@@ -352,6 +354,7 @@ class CheckerApp:
         self.status_label.grid(row=0, column=0, sticky="w")
         self.verification_label = ttk.Label(footer, text="Verification Required", style="Muted.TLabel", cursor="hand2")
         self.verification_label.grid(row=0, column=1, sticky="e")
+        self.assistant = AssistantLauncher(self, footer)
         Tooltip(self.verification_label, lambda: "Verification Required. BOM quantity basis, units, assembly configurations and stock availability remain unconfirmed. Results are estimates, not production approval.")
         self.export_feedback = ttk.Frame(outer, style="Card.TFrame", padding=8)
         self.export_feedback.grid(row=8, sticky="ew", pady=(6, 0))
@@ -686,6 +689,8 @@ class CheckerApp:
         successful source checks of those roles can authorise a verified evaluation again; a manual Re-evaluate
         cannot. A database read failure discards the evidence of both. The gate generation always moves on, so a
         running evaluation cannot publish (SessionGate.publishing is checked around its COMMIT)."""
+        if self.assistant is not None:
+            self.assistant.invalidate()
         if self.alert_runner is None:
             return
         for role in roles:
@@ -959,7 +964,7 @@ class CheckerApp:
                 self.overview_canvas.yview_moveto(0)
         finally:
             self._resizing = False
-        width = max(100, self.root.winfo_width() - 190)
+        width = max(100, self.outer.winfo_width() - 190)
         if self.db_panel is None:
             self.notice_label.configure(wraplength=width)
         else:  # one line beside Refresh Excel; the full sentence is in the tooltip
@@ -1114,6 +1119,8 @@ class CheckerApp:
         job = self.job  # events carry it: a response from an older job can never overwrite a newer status
         self.status.set(JOB_STATUS.get(label, "Loading files…"))
         sync = sync if self.inventory is not None else None
+        if not sync and self.assistant is not None:
+            self.assistant.invalidate()
         if sync:
             self.sync_active = {role: CHECKING for role, path in sync[0].items() if path}
             self._render_inventory()
@@ -1596,6 +1603,8 @@ class CheckerApp:
     def close(self):
         self.closed = True
         self.cancelled.set()
+        if self.assistant is not None:
+            self.assistant.close()
         if self.history_window is not None:
             self.history_window.close()
         if self.analytics_window is not None:

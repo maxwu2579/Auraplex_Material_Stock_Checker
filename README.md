@@ -16,12 +16,12 @@ The application is not digitally signed, so Windows may show a "Windows protecte
 
 ## Features
 
-Development source includes the reviewed M4C controlled read-only tools and Agent core, plus an M4D DeepSeek
-adapter awaiting separate review (neither is in v1.0.0). No real API was called. There is no chat/settings UI
-yet; that belongs to M4E. Data access requires session-only historical-cache authorization and returns
+Development source includes the reviewed M4C controlled read-only tools and Agent core, the M4D DeepSeek
+adapter (local commit `d25ad29`), and an M4E robot/chat interface awaiting separate review (not in v1.0.0).
+No real API was called in implementation/verification. Data access requires session-only historical-cache authorization and returns
 UNVERIFIED / Cloud Not Verified evidence. External transmission requires a separate, explicit session consent.
 M4C's two P2 follow-ups are fixed in local commit `5b2e75f`; see `M4C_P2_REMEDIATION.md`.
-See `M4D_IMPLEMENTATION_REPORT.md` and `M4D_TEST_REPORT.md` for the adapter's scope and limits.
+See the M4D and M4E implementation/test reports for scope, safety boundaries and untested environments.
 
 - Product ID search (type part of an ID, pick from the list)
 - Production quantity calculation
@@ -224,7 +224,7 @@ Exit codes: `0` saved, `2` configuration/upgrade/journal-mode requirement, `3` s
 
 Task Scheduler behavior references: [StartWhenAvailable](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-startwhenavailable-settingstype-element), [MultipleInstancesPolicy](https://learn.microsoft.com/en-us/windows/win32/taskschd/taskschedulerschema-multipleinstancespolicy-settingstype-element). Temporary actual timed recovery on attempt 2 and exhaustion after attempt 3 passed in source and packaged modes. Native automatic restart was not observed; its cause is retained for later CC investigation. See `M3_2E_SCHEDULER_VALIDATION.md`. Missed-run, clean-machine and other-PC acceptance remain unexecuted. No Email, AI, automatic task registration or company-PC deployment is included in E1.
 
-## AI provider adapter (M4D, source implementation awaiting review)
+## AI provider adapter (M4D, reviewed and committed locally)
 
 `checker.providers.create_provider()` constructs the default DeepSeek adapter without accessing credentials
 or making a request. The existing Agent `Provider` protocol remains the replacement boundary; no other
@@ -232,7 +232,7 @@ provider is silently selected. The adapter defaults to `deepseek-flash` with thi
 official fixed HTTPS `/chat/completions` endpoint and normal function-call messages. Model availability
 has not been verified against a real account. Tools remain locally validated even when the model emits JSON.
 
-The future trusted host must display `provider.disclosure` and obtain consent to `provider.policy` before
+The trusted host must display `provider.disclosure` and obtain consent to `provider.policy` before
 calling `authorize_outbound(policy=provider.policy, accepted=True)`. Declining or restarting leaves outbound
 access disabled. `revoke_outbound()` cancels the current outbound session. Cache consent is a separate
 requirement; a model cannot grant either consent. `preview(messages, tools)` returns the exact JSON body
@@ -246,8 +246,8 @@ or identifiers refuse the request. This is not general secret detection: questio
 can themselves be company-sensitive. Approval of the actual outbound scope is required before live use.
 
 `checker.credentials.WindowsKeyStore` provides save/load/delete through the current user's Windows Credential
-Manager. It has no plaintext settings/file, environment-variable or command-line key fallback. M4E will
-provide the interactive key controls; no actual company key was read or stored during M4D. Other software
+Manager. It has no plaintext settings/file, environment-variable or command-line key fallback. M4E provides
+interactive key controls in development source; no actual company key was read or stored in verification. Other software
 running as the same Windows user can access the user's vault. Python/network buffers cannot guarantee that
 all in-memory key copies are erased.
 
@@ -261,8 +261,8 @@ Run on a host worker. HTTPS cancellation closes the socket, and late replies are
 outlive the caller timeout; the transport keeps its one-worker lock until DNS exits, refuses overlapping
 work and checks cancellation before sending. Reuse one adapter/transport in the host instead of creating
 one for every click. Stock CHECK, local tools and deterministic statistics do not require an AI provider.
-No API integration is wired into the current GUI or scheduled daily tasks; chat, language routing and AI
-notifications remain M4E/M4F. No real API, packaged EXE or second-PC validation has been performed for M4D.
+M4E development source wires the GUI to this adapter. Scheduled daily tasks do not use AI.
+AI reports/Email remain M4F. No real API, packaged EXE or second-PC validation has been performed for M4D/E.
 
 Account reminders: after outbound consent, the adapter also uses DeepSeek's fixed `GET /user/balance`
 endpoint before the first chat request, then at most once every five minutes during active use (including
@@ -282,8 +282,64 @@ the shared account balance stays unchanged. Failed rechecks invalidate older hea
 chat host. Session requests nearing 80%/reaching the local cap and replies hitting their output limit have
 different codes from account exhaustion. Last-request Token usage is recorded only if the API supplies
 valid counts; it never represents Tokens remaining. Chinese/English/Malay notice templates are available
-in `checker.quota.notice_text`. M4E must show these notices and current balance-check state in the chat;
-this source milestone has no visible chatbot yet. Quota data is not sent back to the model or stored in SQLite.
+in `checker.quota.notice_text`. M4E shows these notices and the balance-check state in chat.
+Quota data is not sent back to the model or stored in SQLite.
+
+## Inventory assistant (M4E, development source awaiting review)
+
+Click the blue robot at the bottom right to open/collapse the assistant. Small windows use a separate
+chat window; sufficiently wide windows use a side panel while keeping the checker usable. Chat,
+Local tools, Settings and Evidence are separate tabs. This is not included in the published v1.0.0 EXE.
+
+1. Click **Select historical data…**, review source files, hashes, versions, import times and recorded
+   sync states, and explicitly accept (default No). The assistant reads historical SQLite data only:
+   **UNVERIFIED / Cloud Not Verified**, even when the main checker previously checked Excel.
+   This permission is independent of the main checker's cached mode and of API transmission consent.
+2. Without an API, use **Local tools**. Choose Search material IDs or Search product Sheets, enter part
+   of the name/ID and Run. Select a real candidate, then choose stock, BOM, history, analysis or product
+   shortage estimate and Run. Estimate also requires an actual Storage Sheet and positive integer Qty.
+   Similar IDs and original Sheets stay separate. History ranges are 30/60/90 days. Recorded alerts and
+   sync status are also available. No threshold rules or calculations are changed by this UI.
+3. To use AI interpretation, save your API key in **Settings**. Enter a question in Chat, click
+   **AI permission…**, review the disclosure and exact first request, and accept separately (default No).
+   Granting permission makes no request; Send starts the authorized query. Future questions and selected
+   candidate IDs/Sheets fall within the displayed session scope. Live company-data use needs approval
+   of that scope; no real key/account or company information was used for this milestone's verification.
+4. Enter sends; Shift+Enter adds a line. Send/Run are disabled during a job. Stop, collapse/close,
+   Refresh/source changes, maintenance and database read failures revoke permissions and refuse late
+   results. A cancelled worker must finish before another starts. A subsequent query requires selecting
+   historical data again; API consent is also reset. Account top-up: **Recheck balance on next Send**
+   arms a check for the next authorized message, without sending a request itself.
+
+Replies/warnings support Chinese, English and Malay. Mixed precedence is English > Malay > Chinese;
+explicit reply-language instructions override automatic routing. Known identifiers, source labels, quotes
+and fixed technical tokens do not determine language. Shared/unknown words use the previous reply language
+(first turn English) with a visible notice. The language selector overrides the heuristic. Detection is
+lexical and can be wrong for unusual phrasing; it is not a general multilingual classifier. Existing main
+windows and canonical evidence/status codes are not fully translated. Original descriptions and IDs are
+never translated. Numerical explanations come from deterministic local templates and the existing tools;
+model prose is discarded rather than accepted as stock evidence.
+
+Ambiguous AI searches expose candidates in Local tools; choose one and run the requested local action.
+Each AI Send is a bounded independent question; conversational pronouns are not inferred from prior turns.
+Include the ID/Sheet again or use a selected local candidate. Quick questions insert drafts and never send
+automatically. Source versions, hashes, import/observation times and recorded sync attempts appear in
+answers/Evidence, with an explicit warning that historical success logs do not prove present freshness.
+Missing data is unknown; blank stock is not zero; duplicates are not added. M2's existing row-level
+assumptions are explicitly labelled in estimates. No chat export, inventory write or Email tool is provided.
+
+Quota warnings are deterministic and deduplicated in the selected reply language. The persistent status
+strip shows consent, balance observation/check-due state, usage when supplied and canonical warning codes.
+Low credit, exhausted credit, unknown balance, local request cap and output limit remain distinct.
+Historical records and prior chat replies never become verified inventory merely because AI succeeds.
+
+Only one assistant worker runs at a time; all Tk updates/dialogs run on the UI thread. Display limits:
+80 transcript entries / 160k characters, 80k characters per answer and 200k displayed evidence characters,
+with truncation marked. Tools retain M4C's bounded result/query limits; host Sheet metadata is capped at
+200 Storage Sheets and 200 product Sheets. Conversation, candidate permissions and consent are not saved.
+Draft text survives collapse, but unsaved key input is cleared. Reopening/restarting requires new permissions.
+No new dependency, database migration, M4F feature or release artifact is introduced. See
+`M4E_IMPLEMENTATION_REPORT.md` and `M4E_TEST_REPORT.md` for verification details and delivery limits.
 
 ## Safety
 
@@ -291,7 +347,8 @@ The program reads the selected Storage and BOM workbooks and generates a separat
 
 - Workbooks are opened read-only.
 - The report is always a new file. A source workbook is rejected as the export target, and an existing file is never overwritten.
-- Nothing is uploaded; the tool makes no network connections.
+- The checker and local tools work offline. Optional AI requests require separate explicit session consent;
+  their disclosed question/identifier scope is described above. Workbooks and full database contents are not uploaded.
 
 This repository contains no company data. Tests create their own synthetic workbooks in a temporary folder.
 
