@@ -5,7 +5,7 @@ import sqlite3
 import sys
 from pathlib import Path
 
-from checker.appdata import Settings, default_data_dir
+from checker.appdata import InterfacePreferences, Settings, default_data_dir
 from checker.inventory_db import DatabaseError
 from checker.sync import LOCAL_VERIFIED, InventorySync
 
@@ -142,7 +142,9 @@ def main():
     data_dir = args.data_dir or (Path(args.self_test[2]) / "appdata" if args.self_test else
                                  None if args.smoke_test else default_data_dir())
     inventory, settings, error = open_local_data(data_dir) if data_dir else (None, None, None)
-    app = CheckerApp(root, inventory=inventory, settings=settings, inventory_error=error)
+    # The interface language has its own file beside settings.json; reading it never blocks start-up.
+    preferences = InterfacePreferences(Path(data_dir) / "interface.json") if data_dir else None
+    app = CheckerApp(root, inventory=inventory, settings=settings, inventory_error=error, preferences=preferences)
     if args.smoke_test:
         root.after(150, app.close)
     if args.self_test:

@@ -2,7 +2,8 @@
 import tkinter as tk
 from tkinter import ttk, font
 
-BG, INK, MUTED, BLUE = "#f4f6f8", "#243244", "#687789", "#2363ae"
+# B1 light-blue workbench tokens (row colours below are unchanged).
+BG, INK, MUTED, BLUE = "#eef5fc", "#132f4c", "#4b6684", "#1f6fbf"
 RED, AMBER = "#fde9e7", "#fff4d6"
 
 

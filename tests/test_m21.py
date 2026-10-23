@@ -116,7 +116,8 @@ class FreshWindowLayoutTests(Files):
                     app.stock_path.set(stock.path); app.bom_path.set(bom.path)
                     app._apply('stock', (stock, ('~$storage.xlsx',), None, False))
                     app._apply('bom', (bom, (), None, False))
-                    app.render_result(result); root.update()
+                    app.render_result(result)
+                    app.show_page('check'); root.update()  # B1: the result table is on the shortage check page
                     with self.subTest(scale=scale, size=size):
                         for button in (app.check_button, app.export_button, app.reload_button):
                             x, y = button.winfo_rootx() - root.winfo_rootx(), button.winfo_rooty() - root.winfo_rooty()

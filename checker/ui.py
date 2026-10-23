@@ -13,8 +13,8 @@ from tkinter import font as tkfont
 
 from .core import (DataReadError, ENOUGH, EXCEPTION, ROW_CAVEAT, SHORTAGE, check_materials, display,
                    production_quantity, search_products, select_product)
-from . import alerts, binding, cached, daily, retention, upgrade
-from .queries import overall_state, overall_times, status_text, with_known_failures
+from . import alerts, binding, cached, daily, i18n, retention, upgrade
+from .queries import overall_state, overall_times, with_known_failures
 from .sync import (CHECKING, CLOUD_NOT_VERIFIED, DATABASE_UNAVAILABLE, LOCAL_VERIFIED, NOT_SYNCED, SOURCE_CHANGED,
                    SOURCE_UNAVAILABLE, STATUS_UNKNOWN, SYNC_FAILED, USING_PREVIOUS)
 from .report import ReportError, default_filename, save_verified_report
@@ -23,7 +23,9 @@ from .history_ui import HistoryWindow
 from .analytics_ui import AnalyticsWindow
 from .alerts_ui import AlertsWindow
 from .daily_ui import DailySummaryWindow
+from .assistant_language import tr as tr_assistant
 from .assistant_ui import AssistantLauncher
+from .home_ui import HomePage
 from .presentation import BG, INK, MUTED, BLUE, RED, AMBER, Tooltip, ellipsize, work_area
 
 
@@ -33,15 +35,41 @@ SHEET_GONE = "源文件更新后，所选 Sheet 不再存在/不符合表头。�
 ROLE_NAMES = {"stock": "Storage", "bom": "BOM"}
 NOTICE_TEXT = "Results are calculated from the selected BOM and current saved Storage data."
 SHORT_TIME = "%Y-%m-%d %H:%M"  # compact panel; the details popup shows seconds
-JOB_STATUS = {"检查材料": "Checking materials…", "启动检查": "Checking Excel sources…", "刷新 Excel": "Refreshing Excel…",
-              "预览历史清理": "Preparing local cleanup preview…", "清理历史数据": "Backing up and cleaning local history…",
-              "预览数据库升级": "Preparing database upgrade preview…", "升级数据库": "Backing up and upgrading local database…"}
+# Job label -> status message key (checker.i18n); any other job shows "Loading files…".
+JOB_STATUS = {"检查材料": "st_checking_materials", "启动检查": "st_checking_sources", "刷新 Excel": "st_refreshing",
+              "预览历史清理": "st_cleanup_preview", "清理历史数据": "st_cleanup",
+              "预览数据库升级": "st_upgrade_preview", "升级数据库": "st_upgrade"}
 MAINTENANCE_JOBS = ("预览历史清理", "清理历史数据", "预览数据库升级", "升级数据库")
 LOCAL_COPY_NOTE = ("Local File Checked = at the Last Verified time, the database matched one version of the Excel file "
                    "on this computer. The file can change at any moment afterwards, and Google Drive may not have "
                    "downloaded newer cloud changes yet: the cloud copy is never checked (Cloud Not Verified).")
 UNKNOWN_NOTE = ("The synchronisation status could not be read from the database, so no status is shown as current. "
                 "Data already stored in the database is not deleted.")
+# B1 shell: light-blue sidebar, white top bar and cards. Glyphs from Segoe MDL2 Assets (Windows 10/11).
+SIDE_BG, SIDE_INK, SIDE_WIDE, SIDE_SLIM = "#dbeafa", "#16406b", 212, 60
+ICON_FONT, GLYPH_COLLAPSE, GLYPH_EXPAND = "Segoe MDL2 Assets", "\ue76b", "\ue76c"
+NAV = (("home", "\ue80f", "nav_home"), ("check", "\ue9d5", "nav_check"), ("materials", "\ue81c", "nav_materials"),
+       ("alerts", "\ue7ba", "nav_alerts"), ("daily", "\ue787", "nav_daily"), ("ai", "\ue99a", "nav_ai"),
+       ("settings", "\ue713", "nav_settings"))
+PAGE_TITLES = {page: key for page, _glyph, key in NAV}
+TREE_COLUMNS = (("code", "col_code", 170), ("description", "col_description", 245), ("required", "col_required", 85),
+                ("stock", "col_stock", 110), ("shortage", "col_shortage", 85), ("result", "col_result", 100),
+                ("status", "col_status", 220), ("rack", "col_rack", 64), ("level", "col_level", 64))
+
+
+class SheetGone(DataReadError):
+    """The selected Sheet disappeared from the re-read file during CHECK (shown with err_sheet_gone)."""
+
+    def __init__(self):
+        super().__init__(SHEET_GONE)
+
+
+class InputProblem(ValueError):
+    """An input that cannot be checked; carries the structured message for the dialog."""
+
+    def __init__(self, message):
+        super().__init__(message.key)
+        self.message = message
 
 
 def clock(seconds):
@@ -53,9 +81,11 @@ def local_time(moment, pattern="%Y-%m-%d %H:%M:%S"):
 
 
 class CheckerApp:
-    def __init__(self, root: tk.Tk, inventory=None, settings=None, inventory_error=None):
+    def __init__(self, root: tk.Tk, inventory=None, settings=None, inventory_error=None, preferences=None):
         """inventory: an InventorySync (local SQLite mirror); settings: remembered file paths. Both optional:
-        without them the checker behaves exactly as v1.0.0 and touches no local data."""
+        without them the checker behaves exactly as v1.0.0 and touches no local data.
+        preferences: an appdata.InterfacePreferences (interface language file), optional; without it English is used
+        and nothing is written."""
         self.root = root
         self.service = CheckerService()
         self.inventory, self.settings, self.inventory_error = inventory, settings, inventory_error
@@ -109,7 +139,22 @@ class CheckerApp:
         self.status = tk.StringVar(value="Ready · Choose Storage and BOM files.")
         self.summary = tk.StringVar(value="尚未检查 · Verification Required")
         self._resize_job = None
+        # B1: interface language (labels only; never the assistant reply or report language) and page state.
+        # Reading the preference file never fails and starts nothing (no sync, no AI): a bad file gives English.
+        self.preferences = preferences
+        language, self.preference_problem = preferences.load() if preferences is not None else ("en", None)
+        self.preference_error = None
+        self.language = i18n.LanguageState(language)
+        # The status bar keeps the newest structured message and renders it in the current language. Only the newest
+        # message exists: a switch re-renders it, it can never bring back an older job's text.
+        self.status_message = i18n.Message("st_ready")
+        self.status.set(self.text(self.status_message))
+        self.i18n_bindings = []   # (widget, key, option, values) refreshed on every language switch
+        self.wrapping = []        # labels whose wraplength follows their card width
+        self.page = "home"
+        self.last_check = None    # what the home card shows about the last CHECK of this session
         self._build()
+        self.language.subscribe(self._language_changed)
         for var in (self.stock_name, self.product_text, self.quantity_text):
             var.trace_add("write", lambda *_: self.invalidate())
         self.root.protocol("WM_DELETE_WINDOW", self.close)
@@ -145,15 +190,344 @@ class CheckerApp:
         self.root.option_add("*TCombobox*Listbox.font", ("Segoe UI", 10))
         style.configure("Treeview", background="white", fieldbackground="white", foreground=INK,
                         font=("Segoe UI", 9), rowheight=max(30, int(float(self.root.tk.call("tk", "scaling")) * 19)), borderwidth=0)
-        style.configure("Treeview.Heading", background="#eaf0f5", foreground=INK, font=("Segoe UI", 9, "bold"), padding=(8, 8))
+        style.configure("Treeview.Heading", background="#e3eefa", foreground=INK, font=("Segoe UI", 9, "bold"), padding=(8, 8))
         style.map("Treeview", background=[("selected", "#dbe9fa")], foreground=[("selected", "#163d6b")])
-        style.configure("Filter.TRadiobutton", background=BG, padding=(10, 5), font=("Segoe UI", 9))
+        style.configure("Filter.TRadiobutton", background="white", padding=(10, 5), font=("Segoe UI", 9))
         style.layout("Filter.TRadiobutton", [("Radiobutton.padding", {"sticky": "nswe", "children": [
             ("Radiobutton.label", {"sticky": "nswe"})]})])
-        style.map("Filter.TRadiobutton", background=[("selected", "#dbe9fa"), ("active", "#eaf0f5")],
+        style.map("Filter.TRadiobutton", background=[("selected", "#dbe9fa"), ("active", "#eaf2fb")],
                   foreground=[("selected", "#174c8a")])
-        self.outer = outer = ttk.Frame(self.root, padding=(16, 12))
-        outer.pack(fill="both", expand=True)
+        # B1 shell styles
+        style.configure("Top.TFrame", background="white")
+        style.configure("Top.TLabel", background="white", foreground=INK)
+        style.configure("TopMuted.TLabel", background="white", foreground=MUTED, font=("Segoe UI", 9))
+        style.configure("Cloud.TLabel", background="#fff0d4", foreground="#8f5200", font=("Segoe UI", 9, "bold"),
+                        padding=(6, 1))
+        style.configure("PageTitle.TLabel", background="white", foreground=INK, font=("Segoe UI", 14, "bold"))
+        style.configure("Lang.TButton", font=("Segoe UI", 9), padding=(8, 2), background="white")
+        style.configure("LangOn.TButton", font=("Segoe UI", 9, "bold"), padding=(8, 2), background="#dcebfb",
+                        foreground="#185a9c")
+        style.configure("Status.TFrame", background="white")
+        style.configure("Status.TLabel", background="white", foreground=MUTED, font=("Segoe UI", 9))
+        # The assistant docks beside self.outer (pack side=right before it); the whole B1 shell is that frame.
+        self.outer = shell = tk.Frame(self.root, background=BG)
+        shell.pack(fill="both", expand=True)
+        shell.columnconfigure(1, weight=1)
+        shell.rowconfigure(1, weight=1)
+        self.controls = []
+        self._build_sidebar(shell)
+        self._build_topbar(shell)
+        self.pages = ttk.Frame(shell)
+        self.pages.grid(row=1, column=1, sticky="nsew")
+        self.pages.columnconfigure(0, weight=1)
+        self.pages.rowconfigure(0, weight=1)
+        self.page_frames = {}
+        self._build_check_page()
+        self.home = HomePage(self, self.pages)
+        self.page_frames["home"] = self.home.frame
+        self._build_launcher_pages()
+        self.footer = footer = ttk.Frame(shell, style="Status.TFrame", padding=(12, 4))
+        footer.grid(row=2, column=1, sticky="ew")
+        footer.columnconfigure(0, weight=1)
+        # width=1: a long status is cut at its own cell instead of running under the labels beside it (full text in
+        # the tooltip).
+        self.status_label = ttk.Label(footer, textvariable=self.status, style="Status.TLabel", width=1)
+        self.status_label.grid(row=0, column=0, sticky="ew", padx=(0, 12))
+        Tooltip(self.status_label, self.status.get)
+        self.verification_label = ttk.Label(footer, text="Verification Required", style="Status.TLabel", cursor="hand2")
+        self.verification_label.grid(row=0, column=1, sticky="e")
+        self._tr(self.verification_label, "verification_required")
+        self.assistant = AssistantLauncher(self, footer)
+        Tooltip(self.verification_label, lambda: "Verification Required. BOM quantity basis, units, assembly configurations and stock availability remain unconfirmed. Results are estimates, not production approval.")
+        self.root.bind("<Configure>", self._resize, add="+")
+        self.show_page("home")
+        self._schedule_resize()
+
+    # ------------------------------------------------------------------ B1 shell
+    def _tr(self, widget, key, option="text", **values):
+        """Register a widget option for the interface language (updated on every switch)."""
+        self.i18n_bindings.append((widget, key, option, values))
+        widget.configure(**{option: i18n.tr(key, self.language.language, **values)})
+        return widget
+
+    def t(self, key, **values):
+        return i18n.tr(key, self.language.language, **values)
+
+    def text(self, message):
+        """A structured message (or plain text) in the current interface language."""
+        return i18n.render(message, self.language.language)
+
+    def _set_status(self, message):
+        self.status_message = message
+        self.status.set(self.text(message))
+
+    def _db_suffix(self):
+        """' · Inventory Database: <state> — Cloud Not Verified' for the state shown now (a snapshot)."""
+        return i18n.Message("st_db_suffix", state=i18n.State(self.db_overall), cloud=CLOUD_NOT_VERIFIED)
+
+    def _render_preference(self):
+        label = getattr(self, "preference_label", None)
+        if label is None:
+            return
+        if self.preference_error is not None:
+            text = self.t("pref_failed", error=self.preference_error)
+        elif self.preference_problem is not None:
+            text = self.t("pref_unreadable")
+        else:
+            text = ""
+        label.configure(text=text)
+
+    def set_language(self, language):
+        """Interface language only: no Excel read, sync, AI call or permission change; inputs, results, filters and
+        running jobs are untouched (the Tk variables and objects stay the same)."""
+        self.language.set(language)
+
+    def _language_changed(self, _language):
+        for widget, key, option, values in list(self.i18n_bindings):
+            try:
+                widget.configure(**{option: self.t(key, **values)})
+            except tk.TclError:
+                self.i18n_bindings.remove((widget, key, option, values))
+        for code, button in self.lang_buttons.items():
+            button.configure(style="LangOn.TButton" if code == self.language.language else "Lang.TButton")
+        self._apply_tree_headings()
+        self._apply_filter_labels()
+        self._render_nav()
+        self.page_title.configure(text=self.t(PAGE_TITLES[self.page]))
+        self._render_inventory()
+        self._render_alerts()
+        for role in ROLES:
+            self._refresh_file_card(role)
+        self.home.render()
+        self.status.set(self.text(self.status_message))
+        if self.preferences is not None:
+            try:
+                self.preferences.save(self.language.language)
+                self.preference_error = self.preference_problem = None
+            except OSError as exc:  # this session keeps the language; nothing else depends on the file
+                self.preference_error = f"{type(exc).__name__}: {exc}"
+        self._render_preference()
+        self._schedule_resize()
+
+    def _build_sidebar(self, shell):
+        self.sidebar = side = tk.Frame(shell, background=SIDE_BG, width=SIDE_WIDE)
+        side.grid(row=0, column=0, rowspan=3, sticky="nsw")
+        side.grid_propagate(False)
+        side.columnconfigure(0, weight=1)
+        brand = tk.Frame(side, background=SIDE_BG)
+        brand.grid(row=0, column=0, sticky="ew", padx=10, pady=(12, 10))
+        tk.Label(brand, text="MSC", background=BLUE, foreground="white", font=("Segoe UI", 9, "bold"), width=4,
+                 height=2).pack(side="left")
+        self.brand_text = tk.Label(brand, text="Material Stock\nChecker", background=SIDE_BG, foreground=SIDE_INK,
+                                   font=("Segoe UI", 10, "bold"), justify="left")
+        self.brand_text.pack(side="left", padx=(8, 0))
+        self.nav_items = {}
+        for row, (page, glyph, key) in enumerate(NAV, 1):
+            item = tk.Frame(side, background=SIDE_BG, cursor="hand2", takefocus=1, highlightthickness=1,
+                            highlightbackground=SIDE_BG, highlightcolor=BLUE)
+            item.grid(row=row, column=0, sticky="ew", padx=6, pady=1)
+            icon = tk.Label(item, text=glyph, background=SIDE_BG, foreground=SIDE_INK, font=(ICON_FONT, 13), width=2)
+            icon.pack(side="left", padx=(6, 4), pady=7)
+            text = tk.Label(item, text="", background=SIDE_BG, foreground=SIDE_INK, font=("Segoe UI", 10), anchor="w")
+            text.pack(side="left", fill="x", expand=True)
+            for widget in (item, icon, text):
+                widget.bind("<Button-1>", lambda _e, p=page: self.show_page(p))
+            item.bind("<Return>", lambda _e, p=page: self.show_page(p))
+            item.bind("<space>", lambda _e, p=page: self.show_page(p))
+            Tooltip(item, lambda k=key, p=page: self.t(k) + ("\n" + self.alert_text if p == "alerts" else ""))
+            self.nav_items[page] = (item, icon, text, key)
+        side.rowconfigure(len(NAV) + 1, weight=1)
+        self.collapse_item = tk.Label(side, text=GLYPH_COLLAPSE, background=SIDE_BG, foreground=SIDE_INK,
+                                      font=(ICON_FONT, 11), cursor="hand2", anchor="w", padx=12, pady=8)
+        self.collapse_item.grid(row=len(NAV) + 2, column=0, sticky="ew")
+        self.collapse_item.bind("<Button-1>", lambda _e: self.toggle_sidebar())
+        Tooltip(self.collapse_item, lambda: self.t("expand" if self.sidebar_slim else "collapse"))
+        self.sidebar_user = None   # None: automatic (slim below 1100 px); True/False: the user's choice
+        self.sidebar_slim = False
+
+    def toggle_sidebar(self):
+        self.sidebar_user = not self.sidebar_slim
+        self._apply_sidebar()
+
+    def _apply_sidebar(self):
+        width = self.outer.winfo_width() if self.outer.winfo_width() > 1 else self.root.winfo_width()
+        auto = width < 1100 * self._scale()  # the shell narrows when the assistant is docked beside it
+        slim = self.sidebar_user if self.sidebar_user is not None else auto
+        if slim == self.sidebar_slim and self.sidebar.winfo_reqwidth() > 1:
+            return
+        self.sidebar_slim = slim
+        self.sidebar.configure(width=SIDE_SLIM if slim else int(SIDE_WIDE * self._scale()))
+        self.brand_text.pack_forget() if slim else self.brand_text.pack(side="left", padx=(8, 0))
+        for item, icon, text, key in self.nav_items.values():
+            text.pack_forget() if slim else text.pack(side="left", fill="x", expand=True)
+        self.collapse_item.configure(text=GLYPH_EXPAND if slim else GLYPH_COLLAPSE)
+
+    def _scale(self):
+        return max(1.0, float(self.root.tk.call("tk", "scaling")) / (96 / 72))
+
+    def _render_nav(self):
+        for page, (item, icon, text, key) in self.nav_items.items():
+            active = page == self.page
+            colour, ink = (BLUE, "white") if active else (SIDE_BG, SIDE_INK)
+            for widget in (item, icon, text):
+                widget.configure(background=colour)
+            icon.configure(foreground=ink)
+            label = self.t(key)
+            if page == "alerts" and self.alert_active is not None and self.alert_schema is not None \
+                    and self.alert_schema >= alerts.ALERT_SCHEMA_VERSION:
+                # The stored count; "?" while this session has not re-checked it (details in the tooltip).
+                label += f"  ({self.alert_active}{'' if self.alert_current else '?'})"
+            text.configure(text=label, foreground=ink, font=("Segoe UI", 10, "bold" if active else "normal"))
+
+    def _build_topbar(self, shell):
+        self.topbar = top = ttk.Frame(shell, style="Top.TFrame", padding=(14, 8, 14, 6))
+        top.grid(row=0, column=1, sticky="ew")
+        top.columnconfigure(0, weight=1)
+        title_row = ttk.Frame(top, style="Top.TFrame")
+        title_row.grid(row=0, column=0, sticky="ew")
+        self.page_title = ttk.Label(title_row, text="", style="PageTitle.TLabel")
+        self.page_title.pack(side="left")
+        languages = ttk.Frame(title_row, style="Top.TFrame")
+        languages.pack(side="right")
+        self.lang_buttons = {}
+        for code in ("zh", "en", "ms"):
+            button = ttk.Button(languages, text=i18n.SHORT_NAMES[code], command=lambda c=code: self.set_language(c),
+                                style="LangOn.TButton" if code == self.language.language else "Lang.TButton", width=4)
+            button.pack(side="left", padx=1)
+            self.lang_buttons[code] = button
+        Tooltip(languages, lambda: self.t("lang_note"))
+        # Data bar: database status (or the permanent cloud notice without a database) and Refresh Excel.
+        notice = ttk.Frame(top, style="Top.TFrame")
+        notice.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        notice.columnconfigure(0, weight=1)
+        self.db_panel = None
+        if self.inventory is not None or self.inventory_error is not None:
+            self._build_inventory_panel(notice)
+        else:
+            self.cloud_chip = ttk.Label(notice, text=CLOUD_NOT_VERIFIED, style="Cloud.TLabel")
+            self.cloud_chip.grid(row=0, column=0, sticky="w")
+
+    def _build_launcher_pages(self):
+        """Secondary functions keep their existing windows; these pages make each one discoverable and working."""
+        def page(name, intro_key):
+            frame = ttk.Frame(self.pages, padding=(16, 14))
+            frame.columnconfigure(0, weight=1)
+            card = ttk.Frame(frame, style="Card.TFrame", padding=(16, 14))
+            card.grid(row=0, column=0, sticky="ew")
+            card.columnconfigure(0, weight=1)
+            intro = ttk.Label(card, style="Card.TLabel", wraplength=640, justify="left")
+            intro.grid(row=0, column=0, columnspan=4, sticky="ew", pady=(0, 10))
+            self._tr(intro, intro_key)
+            self.wrapping.append(intro)
+            note = ttk.Label(card, style="CardMuted.TLabel")
+            note.grid(row=2, column=0, columnspan=4, sticky="w", pady=(10, 0))
+            self._tr(note, "not_covered")
+            buttons = ttk.Frame(card, style="Card.TFrame")
+            buttons.grid(row=1, column=0, sticky="w")
+            self.page_frames[name] = frame
+            return frame, buttons, note
+        _f, b, _n = page("materials", "materials_intro")
+        self.history_button = self._tr(ttk.Button(b, command=self.open_history, padding=(10, 5)), "open_history")
+        self.history_button.pack(side="left")
+        self.analytics_link = self._tr(ttk.Button(b, command=self.open_analytics, padding=(10, 5)), "open_analytics")
+        self.analytics_link.pack(side="left", padx=(8, 0))
+        _f, b, _n = page("alerts", "alerts_intro")
+        self.alerts_button = self._tr(ttk.Button(b, command=self.open_alerts, padding=(10, 5)), "open_alerts")
+        self.alerts_button.pack(side="left")
+        # M3.2C entry line: the alert count of the last verified evaluation and whether it was re-checked.
+        self.alerts_label = ttk.Label(b, text=self.alert_text, style="Card.TLabel", font=("Segoe UI", 9, "underline"),
+                                      foreground="#95641a", cursor="hand2")
+        self.alerts_label.pack(side="left", padx=(12, 0))
+        self.alerts_label.bind("<Button-1>", lambda _e: self.open_alerts())
+        Tooltip(self.alerts_label, lambda: "Stock Alerts (M3.2C) from synchronised Excel data. Thresholds and "
+                "units pending business confirmation. Cloud Not Verified. Click to open." +
+                ("" if self.alert_current else f"\nNot re-checked: {self.alert_reason}"))
+        _f, b, _n = page("daily", "daily_intro")
+        self.daily_link = self._tr(ttk.Button(b, command=self.open_daily, padding=(10, 5)), "open_daily")
+        self.daily_link.pack(side="left")
+        _f, b, note = page("ai", "ai_intro")
+        self._tr(ttk.Button(b, command=self.open_ai_reports, padding=(10, 5)), "open_ai").pack(side="left")
+        self._tr(note, "lang_note")  # the assistant keeps its own reply-language rules and language selector
+        frame, b, note = page("settings", "cache_intro")
+        note.grid_remove()  # the cache consent is a dialog of this window, not a separate window
+        self.settings_cache_button = self._tr(ttk.Button(b, command=self.use_cached_data, padding=(10, 5)), "use_cache")
+        self.settings_cache_button.pack(side="left")
+        maintenance = ttk.Frame(frame, style="Card.TFrame", padding=(16, 14))
+        maintenance.grid(row=1, column=0, sticky="ew", pady=(12, 0))
+        heading = ttk.Label(maintenance, style="Card.TLabel", font=("Segoe UI", 11, "bold"))
+        heading.pack(anchor="w")
+        self._tr(heading, "settings_maintenance")
+        row = ttk.Frame(maintenance, style="Card.TFrame")
+        row.pack(anchor="w", pady=(8, 0))
+        if self.inventory is not None:
+            self.maintenance_button = self._tr(ttk.Button(row, command=self.preview_cleanup, padding=(10, 5)),
+                                               "local_history")
+            self.maintenance_button.pack(side="left")
+            self.upgrade_button = self._tr(ttk.Button(row, command=self.preview_upgrade, padding=(10, 5)), "db_upgrade")
+            self.upgrade_button.pack(side="left", padx=(8, 0))
+            self.controls += [(self.maintenance_button, "normal"), (self.upgrade_button, "normal"),
+                              (self.settings_cache_button, "normal")]
+        else:
+            self._tr(ttk.Label(row, style="CardMuted.TLabel"), "needs_db").pack(anchor="w")
+        language = ttk.Frame(frame, style="Card.TFrame", padding=(16, 14))
+        language.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        heading = ttk.Label(language, style="Card.TLabel", font=("Segoe UI", 11, "bold"))
+        heading.pack(anchor="w")
+        self._tr(heading, "language")
+        note = ttk.Label(language, style="CardMuted.TLabel", justify="left")
+        note.pack(anchor="w", fill="x", pady=(6, 0))
+        self._tr(note, "lang_note")
+        self.wrapping.append(note)
+        self.preference_label = ttk.Label(language, style="CardMuted.TLabel", justify="left", foreground="#8f5200")
+        self.preference_label.pack(anchor="w", fill="x", pady=(4, 0))
+        self.wrapping.append(self.preference_label)
+        self._render_preference()
+        files = ttk.Frame(frame, style="Card.TFrame", padding=(16, 14))
+        files.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        heading = ttk.Label(files, style="Card.TLabel", font=("Segoe UI", 11, "bold"))
+        heading.pack(anchor="w")
+        self._tr(heading, "settings_files")
+        row = ttk.Frame(files, style="Card.TFrame")
+        row.pack(anchor="w", pady=(8, 0))
+        self.settings_file_buttons = {}
+        for role, key in (("stock", "storage_file"), ("bom", "bom_file")):
+            button = ttk.Button(row, command=lambda r=role: self.browse(r), padding=(10, 5))
+            self._tr(button, key)
+            button.pack(side="left", padx=(0, 8))
+            self.controls.append((button, "normal"))
+            self.settings_file_buttons[role] = button
+
+    def show_page(self, name):
+        """Show one page; nothing is reloaded, re-read or recalculated."""
+        if name not in self.page_frames:
+            return
+        self.page = name
+        for key, frame in self.page_frames.items():
+            if key == name:
+                frame.grid(row=0, column=0, sticky="nsew")
+            else:
+                frame.grid_remove()
+        self.page_title.configure(text=self.t(PAGE_TITLES[name]))
+        self._render_nav()
+        if name == "home":
+            self.home.render()
+        self._schedule_resize()
+
+    def open_ai_reports(self):
+        if self.assistant is None:
+            return
+        if self.assistant.surface is None:
+            self.assistant.toggle()
+        view = self.assistant.view
+        if view is not None:  # the AI reports tab, found by its title in the assistant's own language
+            title = tr_assistant("report_tab", self.assistant.language)
+            for tab in view.tabs.tabs():
+                if view.tabs.tab(tab, "text") == title:
+                    view.tabs.select(tab)
+
+    def _build_check_page(self):
+        outer = self.check_page = ttk.Frame(self.pages, padding=(14, 10))
+        self.page_frames["check"] = outer
         outer.columnconfigure(0, weight=1)
         outer.rowconfigure(5, weight=1)
         self.overview = ttk.Frame(outer)
@@ -169,60 +543,16 @@ class CheckerApp:
         self.overview_window = self.overview_canvas.create_window(0, 0, anchor="nw", window=self.overview_content)
         self.overview_canvas.bind("<Configure>", lambda e: self.overview_canvas.itemconfigure(self.overview_window, width=e.width))
         self.overview_content.bind("<Configure>", lambda _e: self.overview_canvas.configure(scrollregion=self.overview_canvas.bbox("all")))
-        heading = ttk.Frame(self.overview_content)
-        heading.grid(row=0, sticky="ew", pady=(0, 12))
-        if self.inventory is not None:
-            actions = ttk.Frame(heading)
-            actions.pack(side="right", anchor="n")
-            buttons = ttk.Frame(actions)
-            buttons.pack(anchor="e")
-            self.cache_button = ttk.Button(buttons, text="Use Cached Data…", command=self.use_cached_data,
-                                           padding=(8, 3))
-            self.cache_button.pack(side="right", padx=(12, 0))
-            self.maintenance_button = ttk.Button(buttons, text="Local History…", command=self.preview_cleanup,
-                                                 padding=(8, 3))
-            self.maintenance_button.pack(side="right", padx=(8, 0))
-            # M4A: read-only historical observations in a separate window; never part of CHECK or export.
-            self.history_button = ttk.Button(buttons, text="Inventory History…", command=self.open_history,
-                                             padding=(8, 3))
-            self.history_button.pack(side="right", padx=(8, 0))
-            # M3.2C: alert count of the last verified evaluation, under the buttons (uses the title's height; the
-            # Inventory Database panel and the CHECK row are unchanged). Click opens Stock Alerts.
-            links = ttk.Frame(actions)
-            links.pack(anchor="e", pady=(3, 0))
-            self.alerts_label = ttk.Label(links, text=self.alert_text, font=("Segoe UI", 9, "underline"),
-                                          foreground="#95641a", cursor="hand2")
-            self.alerts_label.pack(side="right")
-            self.alerts_label.bind("<Button-1>", lambda _e: self.open_alerts())
-            Tooltip(self.alerts_label, lambda: "Stock Alerts (M3.2C) from synchronised Excel data. Thresholds and "
-                    "units pending business confirmation. Cloud Not Verified. Click to open." +
-                    ("" if self.alert_current else f"\nNot re-checked: {self.alert_reason}"))
-            # M3.2D: manual daily summary (read-only preview, HTML + JSON on request); never part of CHECK or export.
-            # A link beside the alert line, so the button row (and the title beside it) keeps its width.
-            self.daily_link = ttk.Label(links, text="Daily Summary…", font=("Segoe UI", 9, "underline"),
-                                        foreground=BLUE, cursor="hand2")
-            self.daily_link.pack(side="right", padx=(0, 16))
-            self.daily_link.bind("<Button-1>", lambda _e: self.open_daily())
-            self.analytics_link = ttk.Label(links, text="Analytics…", font=("Segoe UI", 9, "underline"),
-                                            foreground=BLUE, cursor="hand2")
-            self.analytics_link.pack(side="right", padx=(0, 16))
-            self.analytics_link.bind("<Button-1>", lambda _e: self.open_analytics())
-            Tooltip(self.daily_link, lambda: "Daily Stock Summary (M3.2D): generate, preview and save a read-only "
-                    "HTML + JSON summary of one day. Cloud Not Verified.")
-        ttk.Label(heading, text="Material Requirement & Stock Checker", style="Title.TLabel").pack(anchor="w")
-        ttk.Label(heading, text="Check material requirements against current stock.", style="Muted.TLabel").pack(anchor="w", pady=(4, 0))
         files = ttk.Frame(self.overview_content)
-        files.grid(row=1, sticky="ew", pady=(0, 12))
+        files.grid(row=1, sticky="ew", pady=(0, 10))
         files.columnconfigure((0, 1), weight=1, uniform="files")
-        self.controls = []
-        if self.inventory is not None:
-            self.controls.append((self.cache_button, "normal"))
-            self.controls.append((self.maintenance_button, "normal"))
         for col, role in enumerate(("stock", "bom")):
             card = ttk.Frame(files, style="Card.TFrame", padding=(12, 8))
             card.grid(row=0, column=col, sticky="nsew", padx=(0, 6) if col == 0 else (6, 0))
             card.columnconfigure(0, weight=1)
-            ttk.Label(card, text="Storage File" if role == "stock" else "BOM File", style="CardMuted.TLabel").grid(row=0, column=0, sticky="w")
+            title = ttk.Label(card, text="Storage File" if role == "stock" else "BOM File", style="CardMuted.TLabel")
+            title.grid(row=0, column=0, sticky="w")
+            self._tr(title, "storage_file" if role == "stock" else "bom_file")
             button = ttk.Button(card, text="Browse…", command=lambda r=role: self.browse(r))
             button.grid(row=0, column=1, rowspan=2, sticky="ne", padx=(12, 0))
             name = ttk.Label(card, text="Choose an Excel workbook", style="File.TLabel", cursor="hand2")
@@ -243,26 +573,24 @@ class CheckerApp:
         selections = ttk.Frame(outer, style="Card.TFrame", padding=(12, 8))
         selections.grid(row=2, sticky="ew")
         selections.columnconfigure(0, weight=1)
-        ttk.Label(selections, text="Product ID", style="CardMuted.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(selections, text="Quantity", style="CardMuted.TLabel").grid(row=0, column=1, sticky="w", padx=(12, 0))
+        self._tr(ttk.Label(selections, style="CardMuted.TLabel"), "product_id").grid(row=0, column=0, sticky="w")
+        self._tr(ttk.Label(selections, style="CardMuted.TLabel"), "quantity").grid(row=0, column=1, sticky="w", padx=(12, 0))
         self.product_combo = ttk.Combobox(selections, textvariable=self.product_text, state="normal", font=("Segoe UI", 10))
         self.product_combo.grid(row=1, column=0, sticky="ew", pady=(4, 0))
-        self.product_combo.bind("<KeyRelease>", self._search)
-        self.product_combo.bind("<FocusIn>", lambda _event: self._search())
-        self.product_combo.bind("<<ComboboxSelected>>", lambda _event: self._search(reset=True))
-        self.product_combo.bind("<Return>", self._pick)
-        Tooltip(self.product_combo, lambda: self.product_text.get() or "Type part of a Product ID, then select a match.")
+        self._bind_product_box(self.product_combo)
         self.quantity_entry = ttk.Entry(selections, textvariable=self.quantity_text, width=6, font=("Segoe UI", 10))
         self.quantity_entry.grid(row=1, column=1, padx=(12, 12), pady=(4, 0))
         self.quantity_entry.bind("<Return>", lambda _event: self.check())
         self.check_button = ttk.Button(selections, text="CHECK MATERIALS", style="Primary.TButton", command=self.check)
         self.check_button.grid(row=1, column=2, padx=(0, 8), pady=(4, 0))
+        self._tr(self.check_button, "check_button")
         self.export_button = ttk.Button(selections, text="EXPORT EXCEL", command=self.export)
         self.export_button.grid(row=1, column=3, pady=(4, 0))
+        self._tr(self.export_button, "export_button")
         # Multi-sheet stock selection stays explicit. Hide it for the common single-sheet case.
         self.stock_sheet_frame = ttk.Frame(selections, style="Card.TFrame")
         self.stock_sheet_frame.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
-        ttk.Label(self.stock_sheet_frame, text="Storage Sheet", style="CardMuted.TLabel").pack(side="left", padx=(0, 8))
+        self._tr(ttk.Label(self.stock_sheet_frame, style="CardMuted.TLabel"), "storage_sheet").pack(side="left", padx=(0, 8))
         self.stock_combo = ttk.Combobox(self.stock_sheet_frame, textvariable=self.stock_name, state="readonly")
         self.stock_combo.pack(side="left", fill="x", expand=True)
         self.stock_sheet_frame.grid_remove()
@@ -270,42 +598,32 @@ class CheckerApp:
                                (self.check_button, "normal"), (self.export_button, "normal")):
             self.controls.append((control, state))
         notice = ttk.Frame(outer)
-        notice.grid(row=3, sticky="ew", pady=(8, 10))
+        notice.grid(row=3, sticky="ew", pady=(8, 8))
         notice.columnconfigure(0, weight=1)
         self.notice_label = ttk.Label(notice, text=NOTICE_TEXT, style="Muted.TLabel")
         self.notice_label.grid(row=0, column=0, sticky="w")
         Tooltip(self.notice_label, lambda: (NOTICE_TEXT + "\n" if self.db_panel is not None else "") +
                 "Review yellow Exception rows before use.\nVerification Required · " + ROW_CAVEAT)
-        self.reload_button = ttk.Button(notice, text="Reload Files", command=self.reload_files)
-        self.reload_button.grid(row=0, column=1, padx=(8, 0))
+        if self.inventory is not None:
+            self.cache_button = ttk.Button(notice, text="Use Cached Data…", command=self.use_cached_data, padding=(8, 3))
+            self.cache_button.grid(row=0, column=1, padx=(8, 0))
+            self._tr(self.cache_button, "use_cache")
+            self.controls.append((self.cache_button, "normal"))
+        self.reload_button = ttk.Button(notice, text="Reload Files", command=self.reload_files, padding=(8, 3))
+        self.reload_button.grid(row=0, column=2, padx=(8, 0))
+        self._tr(self.reload_button, "reload")
         self.controls.append((self.reload_button, "normal"))
-        self.db_panel = None
-        if self.inventory is not None or self.inventory_error is not None:
-            self._build_inventory_panel(notice)
         self.mode_label = self.notice_label  # Permanent mode warning without an extra pinned row.
-        summary = ttk.Frame(outer)
-        summary.grid(row=4, sticky="ew", pady=(0, 12))
-        for col, (key, title, hint, colour) in enumerate((("total", "Total Materials", "Material rows", INK),
-                 (SHORTAGE, "Shortage", "Needs stock", "#a53432"), (EXCEPTION, "Exceptions", "Check data", "#95641a"),
-                 (ENOUGH, "Enough", "Sufficient stock", "#3b715e"))):
-            summary.columnconfigure(col, weight=1, uniform="summary")
-            card = ttk.Frame(summary, style="Card.TFrame", padding=(12, 6))
-            card.grid(row=0, column=col, sticky="ew", padx=(0 if col == 0 else 4, 0 if col == 3 else 4))
-            ttk.Label(card, text=title, style="CardMuted.TLabel").pack(anchor="w")
-            line = ttk.Frame(card, style="Card.TFrame")
-            line.pack(fill="x", pady=(2, 0))
-            ttk.Label(line, textvariable=self.summary_counts[key], style="Card.TLabel", font=("Segoe UI", 18, "bold"), foreground=colour).pack(side="left")
-            ttk.Label(line, text=hint, style="CardMuted.TLabel").pack(side="left", padx=(10, 0))
         results = ttk.Frame(outer, style="Card.TFrame", padding=8)
         results.grid(row=5, sticky="nsew")
         results.rowconfigure(1, weight=1)
         results.columnconfigure(0, weight=1)
         toolbar = ttk.Frame(results, style="Card.TFrame")
         toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 8))
-        ttk.Label(toolbar, text="Material Results", style="Card.TLabel", font=("Segoe UI", 11, "bold")).pack(side="left", padx=(2, 16))
+        self._tr(ttk.Label(toolbar, style="Card.TLabel", font=("Segoe UI", 11, "bold")), "results_title").pack(side="left", padx=(2, 16))
         self.filter_buttons = {}
-        for label, value in (("All", "All"), ("Shortage", SHORTAGE), ("Exceptions", EXCEPTION), ("Enough", ENOUGH)):
-            button = ttk.Radiobutton(toolbar, text=label, variable=self.filter_category, value=value,
+        for value in ("All", SHORTAGE, EXCEPTION, ENOUGH):
+            button = ttk.Radiobutton(toolbar, variable=self.filter_category, value=value,
                                      style="Filter.TRadiobutton", command=self._fill_tree)
             button.pack(side="left", padx=2)
             self.filter_buttons[value] = button
@@ -316,15 +634,13 @@ class CheckerApp:
         Tooltip(self.result_state_label, lambda: self.result_binding.describe() if self.result_binding else "")
         self.result_state_label.bind("<Button-1>", lambda _e: self.result_binding and
                                      self.file_popup("CHECK result · source versions", self.result_binding.describe()))
-        columns = [("code", "Material ID", 170), ("description", "Description", 245), ("required", "Required", 85),
-                   ("stock", "Stock", 110), ("shortage", "Shortage", 85), ("result", "Result", 100),
-                   ("status", "Data Status", 220), ("rack", "Rack", 64), ("level", "Level", 64)]
-        self.tree = ttk.Treeview(results, columns=[x[0] for x in columns], show="headings", selectmode="browse", height=4)
-        for ident, label, width in columns:
-            self.tree.heading(ident, text=label, anchor="center")
-            heading_width = tkfont.Font(font=("Segoe UI", 9, "bold")).measure(label) + 24
+        self.tree = ttk.Treeview(results, columns=[x[0] for x in TREE_COLUMNS], show="headings", selectmode="browse", height=4)
+        for ident, key, width in TREE_COLUMNS:
+            heading_width = tkfont.Font(font=("Segoe UI", 9, "bold")).measure(i18n.tr(key)) + 24
             self.tree.column(ident, width=max(width, heading_width), minwidth=heading_width, stretch=ident in ("description", "status"),
                              anchor="e" if ident in ("required", "stock", "shortage") else "w")
+        self._apply_tree_headings()
+        self._apply_filter_labels()
         self.tree.grid(row=1, column=0, sticky="nsew")
         y = ttk.Scrollbar(results, orient="vertical", command=self.tree.yview)
         y.grid(row=1, column=1, sticky="ns")
@@ -338,8 +654,8 @@ class CheckerApp:
         self.detail_frame = ttk.Frame(outer, style="Card.TFrame", padding=(10, 6))
         self.detail_frame.grid(row=6, sticky="ew", pady=(8, 0))
         self.detail_frame.columnconfigure(0, weight=1)
-        ttk.Label(self.detail_frame, text="Selected Material · Source & Data", style="CardMuted.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Button(self.detail_frame, text="Close details", command=self.hide_details, padding=(6, 2)).grid(row=0, column=1, sticky="e")
+        self._tr(ttk.Label(self.detail_frame, style="CardMuted.TLabel"), "detail_title").grid(row=0, column=0, sticky="w")
+        self._tr(ttk.Button(self.detail_frame, command=self.hide_details, padding=(6, 2)), "close_details").grid(row=0, column=1, sticky="e")
         self.details = tk.Text(self.detail_frame, height=2, wrap="word", font=("Segoe UI", 9), state="disabled",
                                background="white", foreground=INK, relief="flat", padx=0, pady=4)
         self.details.grid(row=1, column=0, columnspan=2, sticky="ew")
@@ -347,15 +663,6 @@ class CheckerApp:
         scroll.grid(row=1, column=2, sticky="ns")
         self.details.configure(yscrollcommand=scroll.set)
         self.detail_frame.grid_remove()
-        footer = ttk.Frame(outer)
-        footer.grid(row=7, sticky="ew", pady=(8, 0))
-        footer.columnconfigure(0, weight=1)
-        self.status_label = ttk.Label(footer, textvariable=self.status, style="Muted.TLabel")
-        self.status_label.grid(row=0, column=0, sticky="w")
-        self.verification_label = ttk.Label(footer, text="Verification Required", style="Muted.TLabel", cursor="hand2")
-        self.verification_label.grid(row=0, column=1, sticky="e")
-        self.assistant = AssistantLauncher(self, footer)
-        Tooltip(self.verification_label, lambda: "Verification Required. BOM quantity basis, units, assembly configurations and stock availability remain unconfirmed. Results are estimates, not production approval.")
         self.export_feedback = ttk.Frame(outer, style="Card.TFrame", padding=8)
         self.export_feedback.grid(row=8, sticky="ew", pady=(6, 0))
         self.export_feedback.columnconfigure(0, weight=1)
@@ -363,16 +670,45 @@ class CheckerApp:
         self.export_feedback_label.grid(row=0, column=0, sticky="ew")
         Tooltip(self.export_feedback_label, lambda: self.export_path.get())
         self.export_feedback_label.bind("<Button-1>", lambda _e: self.file_popup("Exported report", self.export_path.get()))
-        ttk.Button(self.export_feedback, text="Open Folder", command=self.open_export_folder).grid(row=0, column=1, padx=(8, 0))
-        ttk.Button(self.export_feedback, text="Dismiss", command=self.export_feedback.grid_remove).grid(row=0, column=2, padx=(8, 0))
+        self._tr(ttk.Button(self.export_feedback, command=self.open_export_folder), "open_folder").grid(row=0, column=1, padx=(8, 0))
+        self._tr(ttk.Button(self.export_feedback, command=self.export_feedback.grid_remove), "dismiss").grid(row=0, column=2, padx=(8, 0))
         self.export_feedback.grid_remove()
-        self.root.bind("<Configure>", self._resize, add="+")
         def bind_overview_scroll(widget):
             widget.bind("<MouseWheel>", lambda e: self.overview_canvas.yview_scroll(-int(e.delta / 120), "units"), add="+")
             for child in widget.winfo_children():
                 bind_overview_scroll(child)
         bind_overview_scroll(self.overview)
-        self._schedule_resize()
+
+    def _apply_tree_headings(self):
+        for ident, key, _width in TREE_COLUMNS:
+            self.tree.heading(ident, text=self.t(key), anchor="center")
+
+    def _apply_filter_labels(self):
+        """Filter buttons carry their counts (B1); the counts come from the shown result only."""
+        for value, key in (("All", "filter_all"), (SHORTAGE, "filter_shortage"), (EXCEPTION, "filter_exception"),
+                           (ENOUGH, "filter_enough")):
+            count = self.summary_counts["total" if value == "All" else value].get()
+            self.filter_buttons[value].configure(text=self.t(key) + ("" if count == "—" else f" {count}"))
+
+    def _bind_product_box(self, box):
+        """Product ID search for any box bound to product_text (check page and home)."""
+        box.bind("<KeyRelease>", self._search)
+        box.bind("<FocusIn>", lambda _event: self._search())
+        box.bind("<<ComboboxSelected>>", lambda _event: self._search(reset=True))
+        box.bind("<Return>", self._pick)
+        Tooltip(box, lambda: self.product_text.get() or "Type part of a Product ID, then select a match.")
+
+    def _set_product_values(self, values):
+        for box in self.product_boxes():
+            box.configure(values=values)
+
+    def _set_sheet_values(self, values):
+        for box in (self.stock_combo, getattr(self.home, "sheet_combo", None)):
+            if box is not None:
+                box.configure(values=values)
+
+    def product_boxes(self):
+        return tuple(b for b in (self.product_combo, getattr(getattr(self, "home", None), "product_combo", None)) if b)
 
     def _build_inventory_panel(self, notice):
         """Compact two-line 'Inventory Database' section in the notice row, beside Reload Files: always visible
@@ -380,31 +716,32 @@ class CheckerApp:
         self.db_status = tk.StringVar()
         self.db_times = tk.StringVar()
         self.db_role_text = {role: tk.StringVar() for role in ROLES}
-        panel = self.db_panel = ttk.Frame(notice)
-        panel.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        panel = self.db_panel = ttk.Frame(notice, style="Top.TFrame")
+        panel.grid(row=0, column=0, sticky="ew")
         panel.columnconfigure((0, 1), weight=1, uniform="db")
-        heading = ttk.Frame(panel)
+        heading = ttk.Frame(panel, style="Top.TFrame")
         heading.grid(row=0, column=0, columnspan=2, sticky="ew")
-        self.db_title_label = ttk.Label(heading, text="Inventory Database", style="Muted.TLabel")
+        self.db_title_label = ttk.Label(heading, text="Inventory Database", style="TopMuted.TLabel")
         self.db_title_label.pack(side="left")
+        self._tr(self.db_title_label, "db_title")
         # The status and the cloud limitation are never shortened or hidden, in any state; the times label gives way,
         # then the title. Nothing here checks the Google Drive cloud copy, so "Cloud Not Verified" is permanent.
-        self.db_status_label = ttk.Label(heading, textvariable=self.db_status, font=("Segoe UI", 9, "bold"), cursor="hand2")
+        self.db_status_label = ttk.Label(heading, textvariable=self.db_status, style="Top.TLabel",
+                                         font=("Segoe UI", 9, "bold"), cursor="hand2")
         self.db_status_label.pack(side="left", padx=(10, 0))
-        self.db_cloud_label = ttk.Label(heading, text=CLOUD_NOT_VERIFIED, style="Muted.TLabel", foreground="#95641a",
-                                        cursor="hand2")
+        self.db_cloud_label = ttk.Label(heading, text=CLOUD_NOT_VERIFIED, style="Cloud.TLabel", cursor="hand2")
         self.db_cloud_label.pack(side="left", padx=(12, 0))
-        self.db_times_label = ttk.Label(heading, style="Muted.TLabel", cursor="hand2")
+        self.db_times_label = ttk.Label(heading, style="TopMuted.TLabel", cursor="hand2")
         self.db_times_label.pack(side="left", padx=(16, 0))
         self.db_times_short = ""  # compact form of db_times for narrow windows
-        self.refresh_button = ttk.Button(notice, text="Refresh Excel", command=self.refresh_excel)
+        self.refresh_button = ttk.Button(notice, text="Refresh Excel", command=self.refresh_excel, style="Primary.TButton")
         self.refresh_button.grid(row=0, column=1, rowspan=2, sticky="e", padx=(8, 0))
-        self.reload_button.grid_configure(column=2, rowspan=2)
+        self._tr(self.refresh_button, "refresh")
         self.controls.append((self.refresh_button, "normal"))
         self.db_role_labels = {}
         for col, role in enumerate(ROLES):
             # Full text in db_role_text (details, tests); the label shows it shortened to fit its column.
-            label = ttk.Label(panel, style="Muted.TLabel", cursor="hand2")
+            label = ttk.Label(panel, style="TopMuted.TLabel", cursor="hand2")
             label.grid(row=1, column=col, sticky="ew", pady=(2, 0), padx=(0, 12))
             self.db_role_labels[role] = label
         panel.bind("<Configure>", lambda _e: self._fit_inventory_labels())
@@ -419,9 +756,9 @@ class CheckerApp:
             return
         if self.inventory is None:
             self.db_overall = DATABASE_UNAVAILABLE
-            self.db_status.set(f"Status: {DATABASE_UNAVAILABLE}")
-            self.db_times.set("Excel checks still work; nothing is stored locally. Click for details.")
-            self.db_times_short = "Click for details."
+            self.db_status.set(f"{self.t('status_prefix')}: {i18n.state_text(DATABASE_UNAVAILABLE, self.language.language)}")
+            self.db_times.set(self.t("db_unavailable_times"))
+            self.db_times_short = self.t("click_details")
             for role in ROLES:
                 self.db_role_text[role].set(f"{ROLE_NAMES[role]}: —")
             self._fit_inventory_labels()
@@ -435,22 +772,28 @@ class CheckerApp:
         else:
             overall = CHECKING if active else NOT_SYNCED
         self.db_overall = overall
-        self.db_status.set(f"Status: {overall}")  # "Cloud Not Verified" is the separate, permanent label beside it
+        language = self.language.language
+        # "Cloud Not Verified" is the separate, permanent label beside it
+        self.db_status.set(f"{self.t('status_prefix')}: {i18n.state_text(overall, language)}")
         self.db_status_label.configure(foreground=self._state_colour(overall))
         checked, success = overall_times(roles) if roles else (None, None)
         # A verification time is current only in the verified state; otherwise it is explicitly historical.
-        verified = "Last Verified" if overall == LOCAL_VERIFIED or success is None else "Previously Verified"
-        self.db_times.set(f"{verified}: {local_time(success, SHORT_TIME)}  ·  Last Checked: {local_time(checked, SHORT_TIME)}")
-        self.db_times_short = f"{verified.removeprefix('Last ')} {local_time(success, '%m-%d %H:%M')}"
+        verified = "last_verified" if overall == LOCAL_VERIFIED or success is None else "previously_verified"
+        self.db_times.set(f"{self.t(verified)}: {local_time(success, SHORT_TIME)}  ·  "
+                          f"{self.t('last_checked')}: {local_time(checked, SHORT_TIME)}")
+        short = self.t(verified).removeprefix("Last ") if language == "en" else self.t(verified)
+        self.db_times_short = f"{short} {local_time(success, '%m-%d %H:%M')}"
         for role in ROLES:
             info = roles.get(role)
             state = active.get(role) or (info.label if info else STATUS_UNKNOWN if overall == STATUS_UNKNOWN else NOT_SYNCED)
-            text = f"{ROLE_NAMES[role]}: {state}"
+            text = f"{ROLE_NAMES[role]}: {i18n.state_text(state, language)}"
             if info and info.source_modified:
-                text += f"  ·  Source File Modified {local_time(info.source_modified, SHORT_TIME)}"
+                text += f"  ·  {self.t('source_modified')} {local_time(info.source_modified, SHORT_TIME)}"
             self.db_role_text[role].set(text)
             self.db_role_labels[role].configure(foreground=self._state_colour(state))
         self._fit_inventory_labels()
+        if getattr(self, "home", None) is not None:
+            self.home._render_sources()
 
     def _fit_inventory_labels(self):
         panel = self.db_panel
@@ -461,8 +804,9 @@ class CheckerApp:
         # The status and "Cloud Not Verified" are never shortened. The times show in full, else in compact form; when
         # even that does not fit, the "Inventory Database" title gives way before the verification time does.
         face = tkfont.Font(font=("Segoe UI", 9))
+        # Requested widths include the B1 chip padding of "Cloud Not Verified" and the current font scaling.
         room = (panel.winfo_width() - tkfont.Font(font=("Segoe UI", 9, "bold")).measure(self.db_status.get())
-                - face.measure(self.db_cloud_label.cget("text")) - 44)
+                - self.db_cloud_label.winfo_reqwidth() - 44)
         title = face.measure(self.db_title_label.cget("text")) + 10
         full, short = self.db_times.get(), self.db_times_short or self.db_times.get()
         if panel.winfo_width() <= 1 or face.measure(full) <= room - title:
@@ -532,22 +876,22 @@ class CheckerApp:
                 continue
             info = self.inventory_roles.get(role)
             if self.inventory_read_error is not None:
-                kept = "无法读取数据库同步状态：不能确认此前同步的数据及其时间。数据库中已有的数据不会被删除。"
+                kept = i18n.Message("sync_kept_unknown")
             elif info and info.has_data:
-                kept = (f"数据库保留此前同步的数据（Previously Verified {local_time(info.last_success)}，历史时间），"
-                        "但当前未验证，未显示为新同步。")
+                kept = i18n.Message("sync_kept_previous", time=local_time(info.last_success))
             else:
-                kept = "数据库中没有该文件此前的数据。"
+                kept = i18n.Message("sync_kept_none")
             state = (SOURCE_UNAVAILABLE if result.outcome == "UNAVAILABLE" else
                      SOURCE_CHANGED if result.changed else SYNC_FAILED)
-            notes.append(f"Inventory Database · {ROLE_NAMES[role]}: {state}\n"
-                         f"{result.error}\n{kept}" + ("" if result.recorded else "\n（本次失败未能写入数据库记录。）"))
+            if not result.recorded:
+                kept = i18n.Join((kept, i18n.Message("sync_unrecorded")), "\n")
+            notes.append(i18n.Message("sync_role", role=ROLE_NAMES[role], state=state, error=str(result.error), kept=kept))
         if db_error:
-            notes.append(f"Inventory Database 状态读取失败：{db_error}\n"
-                         f"状态显示为 {STATUS_UNKNOWN}；此前显示的状态已清除，不能视为数据库与源文件一致。")
+            notes.append(i18n.Message("sync_status_failed", error=str(db_error), state=STATUS_UNKNOWN))
         if notes:
-            notes.append("修正后点击 Refresh Excel 重试。")
-        return "\n\n".join(notes)
+            notes.append(i18n.Message("sync_retry"))
+        # A structured note, rendered in the interface language when it is shown ("" when there is nothing to say).
+        return i18n.Join(notes) if notes else ""
 
     def _shared_parse(self, path, role):
         """Worker thread. The sync reuses the checker's own parse of the same file version (no second parse)."""
@@ -570,7 +914,7 @@ class CheckerApp:
         try:
             self.settings.remember(role, path)
         except OSError as exc:
-            self.status.set(f"Could not remember the selected file for next start: {exc}")
+            self._set_status(i18n.Message("st_remember_failed", error=str(exc)))
 
     def _startup(self):
         """Restore remembered files, then check them against the database in the background."""
@@ -587,18 +931,18 @@ class CheckerApp:
         if self.busy:
             return
         if self.inventory is None:
-            messagebox.showerror('Local History', 'A readable local database is required.', parent=self.root)
+            messagebox.showerror('Local History', self.t("needs_db_body"), parent=self.root)
             return
         if self._alerts_running('Local History'):
             return
         service = retention.RetentionService(self.inventory.db_path)
         def done(result):
-            self.maintenance_message = ('Local history cleanup completed' if result.backup else 'Nothing expired')
-            messagebox.showinfo('Local History', self.maintenance_message +
+            self.maintenance_message = ('st_cleanup_done' if result.backup else 'st_nothing_expired')
+            messagebox.showinfo('Local History', self.t(self.maintenance_message) +
                                 ('\nRecovery backup: ' + result.backup if result.backup else '\nNo data deleted.'),
                                 parent=self.root)
         def offer(plan):
-            self.maintenance_message = 'Cleanup preview only; no data deleted'
+            self.maintenance_message = 'st_cleanup_preview_only'
             if plan.empty:
                 messagebox.showinfo('Local History', plan.describe() + '\n\nNothing expired. No data deleted.', parent=self.root)
                 return
@@ -615,7 +959,7 @@ class CheckerApp:
         """M4A: open (or bring forward) the read-only Inventory History window. Independent of CHECK, cache mode and
         maintenance: it reads the database in its own consistent read transactions and changes nothing here."""
         if self.inventory is None:
-            messagebox.showerror("Inventory History", "A readable local database is required.", parent=self.root)
+            messagebox.showerror("Inventory History", self.t("needs_db_body"), parent=self.root)
             return
         if self.history_window is not None and not self.history_window.closed:
             self.history_window.lift()
@@ -627,7 +971,7 @@ class CheckerApp:
 
     def open_analytics(self):
         if self.inventory is None:
-            messagebox.showerror('Inventory Analytics', 'A readable local database is required.', parent=self.root)
+            messagebox.showerror('Inventory Analytics', self.t("needs_db_body"), parent=self.root)
             return
         if self.analytics_window is not None and not self.analytics_window.closed:
             self.analytics_window.lift()
@@ -641,7 +985,7 @@ class CheckerApp:
     def open_daily(self):
         """M3.2D: open (or bring forward) the Daily Stock Summary window. It only reads the database."""
         if self.alert_runner is None:
-            messagebox.showerror("Daily Stock Summary", "A readable local database is required.", parent=self.root)
+            messagebox.showerror("Daily Stock Summary", self.t("needs_db_body"), parent=self.root)
             return
         if self.daily_window is not None and not self.daily_window.closed:
             self.daily_window.lift()
@@ -663,7 +1007,7 @@ class CheckerApp:
     # obsolete background result) shows the stored alerts as "not re-checked" and never resolves them.
     def open_alerts(self):
         if self.alert_runner is None:
-            messagebox.showerror("Stock Alerts", "A readable local database is required.", parent=self.root)
+            messagebox.showerror("Stock Alerts", self.t("needs_db_body"), parent=self.root)
             return
         if self.alerts_window is not None and not self.alerts_window.closed:
             self.alerts_window.lift()
@@ -748,6 +1092,9 @@ class CheckerApp:
 
     def _render_alerts(self):
         self.alert_text = self.alert_text_now()
+        if getattr(self, "home", None) is not None:
+            self._render_nav()
+            self.home.render_alerts()
         if self.alert_runner is not None:
             self.alerts_label.configure(text=self.alert_text)
             if self.alerts_window is not None and not self.alerts_window.closed:
@@ -812,6 +1159,8 @@ class CheckerApp:
                     self.alert_reason = result.reason or "the evaluation could not verify the Excel files"
         if changed:
             self._render_alerts()
+            if self.alert_read_error is None:
+                self.home.request()  # the stored alerts changed: the home page reads them again when it is shown
         if refreshed and self.alerts_window is not None and not self.alerts_window.closed:
             self.alerts_window.reload()
 
@@ -844,7 +1193,7 @@ class CheckerApp:
         database = self.inventory.db_path
 
         def done(backup):
-            self.maintenance_message = "Local database upgraded"
+            self.maintenance_message = "st_upgraded"
             self._invalidate_alerts("the local database was upgraded")
             messagebox.showinfo("Database upgrade", "Local database upgraded.\nRecovery backup: " + backup +
                                 "\n\nThe current Excel files will now be read again (thresholds are captured if they "
@@ -854,7 +1203,7 @@ class CheckerApp:
                 self.root.after_idle(self.refresh_excel)
 
         def offer(plan):
-            self.maintenance_message = "Database upgrade preview only; nothing changed"
+            self.maintenance_message = "st_upgrade_preview_only"
             job = self.job
             answer = messagebox.askyesno("Upgrade local database?", plan.describe() +
                                          "\n\nCreate a backup and upgrade the local database now?",
@@ -869,7 +1218,7 @@ class CheckerApp:
         if self.busy:
             return
         if self.inventory is None:
-            messagebox.showerror("Cache unavailable", "A readable local database is required.", parent=self.root)
+            messagebox.showerror("Cache unavailable", self.t("needs_db_body"), parent=self.root)
             return
         database = self.inventory.db_path
         def offer(snapshot):
@@ -896,7 +1245,7 @@ class CheckerApp:
             return
         self.cache_selection = None
         self.cache_authorized = False
-        self.mode_label.configure(text=NOTICE_TEXT, foreground=MUTED)
+        self.mode_label.configure(text=self.t("notice"), foreground=MUTED)
         if clear:
             for role in ROLES:
                 self._clear_role(role)
@@ -905,7 +1254,7 @@ class CheckerApp:
 
     def _check_cached(self, selected, count):
         if not self.cache_authorized:
-            messagebox.showerror(binding.OUTDATED, "缓存授权已失效。请点击 Use Cached Data 重新确认版本。", parent=self.root)
+            messagebox.showerror(binding.OUTDATED, self.t("err_cache_expired"), parent=self.root)
             return
         snapshot = self.cache_selection
         def action():
@@ -946,11 +1295,12 @@ class CheckerApp:
         self._resizing = True
         try:
             self.root.update_idletasks()
-            # Reserve the table and pinned actions; only the title/file overview can scroll.
-            other = self.outer.winfo_reqheight() - self.overview.winfo_reqheight() - self.tree.winfo_reqheight()
+            self._apply_sidebar()
+            # Reserve the table and pinned actions; only the file overview can scroll.
+            other = self._fixed_height()
             if self.db_panel is not None and self._compact_inventory(other):
                 self.root.update_idletasks()
-                other = self.outer.winfo_reqheight() - self.overview.winfo_reqheight() - self.tree.winfo_reqheight()
+                other = self._fixed_height()
             available = max(90, self.root.winfo_height() - other - 130)
             natural = self.overview_content.winfo_reqheight()
             target = min(natural, available)
@@ -964,15 +1314,26 @@ class CheckerApp:
                 self.overview_canvas.yview_moveto(0)
         finally:
             self._resizing = False
-        width = max(100, self.outer.winfo_width() - 190)
+        for label in self.wrapping:
+            room = label.master.winfo_width() - 40  # inside the card padding
+            if room > 100 and int(str(label.cget("wraplength") or 0)) != room:
+                label.configure(wraplength=room)
+        self.home.fit()
+        width = max(100, self.check_page.winfo_width() - 190)
+        notice = cached.LABEL if self.cache_selection else self.t("notice")
         if self.db_panel is None:
-            self.notice_label.configure(wraplength=width)
-        else:  # one line beside Refresh Excel; the full sentence is in the tooltip
-            self.notice_label.configure(text=ellipsize(cached.LABEL if self.cache_selection else NOTICE_TEXT,
-                                                       width - self.refresh_button.winfo_reqwidth() - 8,
-                                                       ("Segoe UI", 9)))
+            self.notice_label.configure(text=notice, wraplength=width)
+        else:  # one line beside the buttons of its row; the full sentence is in the tooltip
+            row = self.notice_label.master
+            room = row.winfo_width() - sum(w.winfo_reqwidth() + 8 for w in row.grid_slaves(row=0) if w is not self.notice_label)
+            self.notice_label.configure(text=ellipsize(notice, max(60, room - 8), ("Segoe UI", 9)))
         if self.export_path.get():
             self.export_feedback_label.configure(text=ellipsize(self.export_path.get(), width - 180, ("Segoe UI", 9), middle=True))
+
+    def _fixed_height(self):
+        """Height of everything on the check page and around it except the file overview and the table."""
+        return (self.topbar.winfo_reqheight() + self.footer.winfo_reqheight() + self.check_page.winfo_reqheight()
+                - self.overview.winfo_reqheight() - self.tree.winfo_reqheight())
 
     def _compact_inventory(self, other):
         """Short window: hide the per-file database line (still in the tooltip and details) so the table keeps its
@@ -1015,20 +1376,23 @@ class CheckerApp:
         book = self.stock_book if role == "stock" else self.bom_book
         width = max(40, view["card"].winfo_width() - 24)
         name_width = max(40, width - view["button"].winfo_reqwidth() - 12)
-        view["name"].configure(text=ellipsize(Path(path).name if path else "Choose an Excel workbook", name_width, ("Segoe UI", 10, "bold")))
+        view["name"].configure(text=ellipsize(Path(path).name if path else self.t("choose_workbook"), name_width, ("Segoe UI", 10, "bold")))
         view["path"].configure(text=ellipsize(str(Path(path).parent) if path else ".xlsx / .xlsm", width, ("Segoe UI", 9), middle=True))
-        view["button"].configure(text="Change…" if path else "Browse…")
+        view["button"].configure(text=self.t("change") if path else self.t("browse"))
         if book:
             status = (f"{cached.LABEL} · Imported {clock(book.loaded_at)}" if self.cache_selection else
-                      f"Loaded · Saved {clock(book.fingerprint[2] / 1e9)} · Loaded {clock(book.loaded_at)}")
+                      self.t("card_loaded", saved=clock(book.fingerprint[2] / 1e9), loaded=clock(book.loaded_at)))
         else:
-            status = "Loading…" if view["loading"] else "Load failed · Click for details" if path else "Not loaded"
+            status = (self.t("card_loading") if view["loading"] else self.t("card_failed") if path else
+                      self.t("card_not_loaded"))
         view["status"].configure(text=ellipsize(status, width, ("Segoe UI", 9)))
         if view["locks"] and book:
-            view["warning"].configure(text="File may currently be open in Excel")
+            view["warning"].configure(text=self.t("card_locked"))
             view["warning"].grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
         else:
             view["warning"].grid_remove()
+        if getattr(self, "home", None) is not None:
+            self.home._render_sources()
         self._schedule_resize()
 
     def hide_details(self):
@@ -1044,7 +1408,7 @@ class CheckerApp:
             try:
                 os.startfile(str(Path(self.export_path.get()).parent))
             except OSError as exc:
-                messagebox.showerror("Open Folder failed", str(exc), parent=self.root)
+                messagebox.showerror(self.t("title_open_folder"), str(exc), parent=self.root)
 
     def _detail_text(self, text):
         self.details.configure(state="normal")
@@ -1096,6 +1460,9 @@ class CheckerApp:
                                               font=("Segoe UI", 9, "bold"))
         if not self.busy:  # an outdated result can never be exported
             self.export_button.configure(state="normal" if self.result is None or self.result_exportable else "disabled")
+        self._apply_filter_labels()
+        if getattr(self, "home", None) is not None:
+            self.home.render_check()
 
     def _set_busy(self, busy):
         self.busy = busy
@@ -1117,7 +1484,7 @@ class CheckerApp:
         self._set_busy(True)
         self.job += 1
         job = self.job  # events carry it: a response from an older job can never overwrite a newer status
-        self.status.set(JOB_STATUS.get(label, "Loading files…"))
+        self._set_status(i18n.Message(JOB_STATUS.get(label, "st_loading")))
         sync = sync if self.inventory is not None else None
         if not sync and self.assistant is not None:
             self.assistant.invalidate()
@@ -1151,6 +1518,7 @@ class CheckerApp:
         if self.closed:
             return
         self._drain_alert_events()
+        self.home.drain()
         while True:  # progress of a running sync (worker thread → queue → here, the Tk thread)
             try:
                 job, role, state = self.inventory_events.get_nowait()
@@ -1171,8 +1539,7 @@ class CheckerApp:
             sync_note = self._show_inventory(report) if report is not None else ""
             self._note_sync(report)
             # Every outcome, failures included, shows the current database state (and its cloud limitation).
-            db_suffix = (f" · Inventory Database: {status_text(self.db_overall)}"
-                         if report is not None and self.db_panel is not None else "")
+            db_suffix = self._db_suffix() if report is not None and self.db_panel is not None else ""
             if isinstance(error, retention.RetentionError):
                 if isinstance(error, retention.RetentionReadError):
                     self.inventory_roles = {}
@@ -1182,11 +1549,11 @@ class CheckerApp:
                     if self.cache_selection is not None:
                         self.cache_authorized = False
                         self.mode_label.configure(text=cached.LABEL + ' · Reselect required', foreground='#b00020')
-                self.status.set('Local history maintenance refused/failed · ' + CLOUD_NOT_VERIFIED)
+                self._set_status(i18n.Message("st_maintenance_failed", cloud=CLOUD_NOT_VERIFIED))
                 messagebox.showerror('Local History', str(error), parent=self.root)
             elif isinstance(error, upgrade.UpgradeError):
                 # Refused or rolled back: the database stays schema 1 and every loaded file stays as it was.
-                self.status.set('Database upgrade refused/failed; nothing changed · ' + CLOUD_NOT_VERIFIED)
+                self._set_status(i18n.Message("st_upgrade_failed", cloud=CLOUD_NOT_VERIFIED))
                 messagebox.showerror('Database upgrade', str(error), parent=self.root)
             elif error is not None:
                 if isinstance(error, cached.CacheError) and self.cache_selection is not None:
@@ -1197,14 +1564,16 @@ class CheckerApp:
                     self.inventory_read_error = str(error)
                     self._render_inventory()
                     self.alert_read_failed(error)
-                    db_suffix = f" · Inventory Database: {status_text(self.db_overall)}"
+                    db_suffix = self._db_suffix()
                 # Unexpected failure of the whole action: nothing loaded can be trusted, so clear everything.
                 for role in ROLES:
                     self.file_view[role]["loading"] = False
                     self._clear_role(role)
                 self.invalidate()
-                self.status.set("Read / check failed · Reload Files to retry." + db_suffix)
-                messagebox.showerror("读取/检查失败", "\n\n".join(x for x in (str(error), sync_note) if x), parent=self.root)
+                self._set_status(i18n.Message("st_failed_reload", db=db_suffix))
+                messagebox.showerror(self.t("title_failed"),
+                                     self.text(i18n.Join((i18n.Message("err_unexpected", error=str(error)), sync_note))),
+                                     parent=self.root)
             else:
                 # A callback returns text when a file failed; it has already cleared only that file.
                 problem = callback(data)
@@ -1215,32 +1584,35 @@ class CheckerApp:
                     return
                 if problem:
                     self.invalidate()
-                    self.status.set("Read / check failed · Click the file card for details." + db_suffix)
-                    messagebox.showerror("读取/检查失败", "\n\n".join(x for x in (problem, sync_note) if x), parent=self.root)
+                    self._set_status(i18n.Message("st_failed_card", db=db_suffix))
+                    messagebox.showerror(self.t("title_failed"), self.text(i18n.Join((problem, sync_note))),
+                                         parent=self.root)
                 else:
+                    # Every value is a snapshot of this job's outcome: re-rendering never re-derives it.
                     if label in MAINTENANCE_JOBS:
-                        status = self.maintenance_message + ' · ' + CLOUD_NOT_VERIFIED
+                        status = i18n.Message("st_maintenance", message=i18n.Message(self.maintenance_message),
+                                              cloud=CLOUD_NOT_VERIFIED)
                     elif self.cache_selection is not None:
-                        status = cached.LABEL + " · Cloud Not Verified · Historical data only"
+                        status = i18n.Message("st_cache_mode", label=cached.LABEL)
                     elif self.result and not self.result_current:
-                        status = (f"{binding.OUTDATED} · the source changed while being checked "
-                                  f"({self.result_binding.attempts} attempts); export disabled. Click CHECK again.")
+                        status = i18n.Message("st_outdated_during_check", outdated=binding.OUTDATED,
+                                              attempts=self.result_binding.attempts)
                     elif self.result:
-                        status = f"Checked {len(self.result.rows)} materials in {elapsed:.2f}s · Local Sources Verified"
+                        status = i18n.Message("st_checked", count=len(self.result.rows), seconds=f"{elapsed:.2f}")
                     elif label == "启动检查" and self.stock_book is None and self.bom_book is None:
-                        status = "Ready · Choose Storage and BOM files."
+                        status = i18n.Message("st_ready")
                     else:
                         materials = sum(len(s.materials) for s in self.stock_book.stock_sheets) if self.stock_book else 0
                         products = len(self.bom_book.products) if self.bom_book else 0
-                        status = f"Loaded {materials} storage rows · {products} products"
-                    self.status.set(status + db_suffix)
+                        status = i18n.Message("st_loaded", materials=materials, products=products)
+                    self._set_status(i18n.Join((status, db_suffix), ""))
                     if sync_note:
                         # The Excel result is valid; only the local database copy could not be updated.
-                        messagebox.showwarning("Inventory Database", sync_note, parent=self.root)
+                        messagebox.showwarning(self.t("db_title"), self.text(sync_note), parent=self.root)
         self.poll_id = self.root.after(50, self._poll)
 
     def browse(self, role):
-        path = filedialog.askopenfilename(parent=self.root, title="选择库存 Excel" if role == "stock" else "选择 BOM Excel",
+        path = filedialog.askopenfilename(parent=self.root, title=self.t("title_choose_stock" if role == "stock" else "title_choose_bom"),
                                          filetypes=[("Excel (.xlsx / .xlsm)", "*.xlsx *.xlsm"), ("All files", "*.*")])
         if path:
             self.load_file(role, path)
@@ -1254,7 +1626,7 @@ class CheckerApp:
         else:
             self.bom_book = None
             self.product_text.set("")
-            self.product_combo.configure(values=())
+            self._set_product_values(())
         self._refresh_file_card(role)
 
     def _read(self, role, path, force=False):
@@ -1278,7 +1650,8 @@ class CheckerApp:
             label.configure(foreground="#b00020")
             self.file_view[role]["locks"] = ()
             self._refresh_file_card(role)
-            return f"{ROLES[role]}：{error}"
+            detail = i18n.Message("err_sheet_gone") if isinstance(error, SheetGone) else str(error)
+            return i18n.Message("err_role_failed", role=i18n.Message("role_" + role), error=detail)
         (self._stock_loaded if role == "stock" else self._bom_loaded)(book, previous)
         text = (f"{Path(book.path).name} · 文件保存时间 {clock(book.fingerprint[2] / 1e9)} · 成功加载 {clock(book.loaded_at)} · "
                 f"{now} 刷新检查：" + ("文件未变化，沿用已加载数据" if reused else "已从文件重新读取"))
@@ -1295,7 +1668,8 @@ class CheckerApp:
     def _loaded(self, outcomes, previous=None):
         previous = previous or {}
         errors = [self._apply(role, outcomes[role], previous.get(role, "")) for role in ROLES if role in outcomes]
-        return "\n\n".join(e for e in errors if e)
+        errors = [e for e in errors if e]
+        return i18n.Join(errors) if errors else ""
 
     def load_file(self, role, path):
         if self.busy:
@@ -1309,7 +1683,7 @@ class CheckerApp:
     def _stock_loaded(self, book, previous=""):
         self.stock_book = book
         names = tuple(s.name for s in book.stock_sheets)
-        self.stock_combo.configure(values=names)
+        self._set_sheet_values(names)
         if len(names) > 1:
             self.stock_sheet_frame.grid()
         else:
@@ -1320,7 +1694,7 @@ class CheckerApp:
 
     def _bom_loaded(self, book, previous=""):
         self.bom_book = book
-        self.product_combo.configure(values=tuple(p.display_name for p in book.products))
+        self._set_product_values(tuple(p.display_name for p in book.products))
         selected = next((p for p in book.products if p.sheet_name == previous), None)
         self.product_text.set(selected.display_name if selected else "")
         self._detail_text(f"识别 {len(book.products)} 个 Product ID（来自含材料的 BOM Sheet）。请输入搜索并选择其中一个。\n" + "\n".join(book.notes))
@@ -1328,19 +1702,20 @@ class CheckerApp:
     def _search(self, _event=None, reset=False):
         if self.bom_book is not None:
             products = self.bom_book.products if reset or select_product(self.bom_book.products, self.product_text.get()) else search_products(self.bom_book.products, self.product_text.get())
-            self.product_combo.configure(values=tuple(p.display_name for p in products))
+            self._set_product_values(tuple(p.display_name for p in products))
 
     def _pick(self, _event=None):
         """Enter in the Product ID box: take the only candidate, or open the list when there are several."""
         if self.bom_book is None or select_product(self.bom_book.products, self.product_text.get()):
             return
         matches = search_products(self.bom_book.products, self.product_text.get())
-        self.product_combo.configure(values=tuple(p.display_name for p in matches))
+        self._set_product_values(tuple(p.display_name for p in matches))
+        box = _event.widget if _event is not None and _event.widget in self.product_boxes() else self.product_combo
         if len(matches) == 1:
             self.product_text.set(matches[0].display_name)
-            self.product_combo.icursor("end")
+            box.icursor("end")
         elif matches:
-            self.product_combo.event_generate("<Down>")
+            box.event_generate("<Down>")
 
     def reload_files(self, force=True, trigger="reload", label="强制重新读取"):
         if self.busy:
@@ -1350,7 +1725,7 @@ class CheckerApp:
         product = select_product(self.bom_book.products, self.product_text.get()) if self.bom_book else None
         previous = {"stock": self.stock_name.get(), "bom": product.sheet_name if product else ""}
         if not any(paths.values()):
-            messagebox.showerror("未选择文件", "请先 Browse 选择文件。", parent=self.root)
+            messagebox.showerror(self.t("title_no_files"), self.t("err_no_files"), parent=self.root)
             return
         self._start(lambda: {role: self._read(role, path, force=force) for role, path in paths.items() if path},
                     lambda outcomes: self._loaded(outcomes, previous), label,
@@ -1360,23 +1735,28 @@ class CheckerApp:
         if self.busy:
             return
         try:
-            production_quantity(self.quantity_text.get())
+            try:
+                production_quantity(self.quantity_text.get())
+            except ValueError as exc:  # the rule and its own wording stay in checker.core; shown as the detail
+                raise InputProblem(i18n.Message("err_quantity", detail=str(exc))) from exc
             if self.stock_book is None or self.bom_book is None:
-                raise ValueError("请先成功读取库存与 BOM 文件。未加载的文件可在修正后点击 Reload Files 重试。")
+                raise InputProblem(i18n.Message("err_files_first"))
             product = select_product(self.bom_book.products, self.product_text.get())
             if product is None:
                 matches = search_products(self.bom_book.products, self.product_text.get()) if self.product_text.get().strip() else ()
-                self.product_combo.configure(values=tuple(p.display_name for p in matches or self.bom_book.products))
-                raise ValueError(f"“{self.product_text.get()}” 不是一个已选定的 Product ID。" +
-                                 (f"有 {len(matches)} 个匹配项，请从下拉列表中选择一个。" if matches else
-                                  "BOM 中没有匹配的 Product ID；请从下拉列表选择实际存在的产品。") +
-                                 "部分名称、虚构名称或歧义名称不能检查。")
+                self._set_product_values(tuple(p.display_name for p in matches or self.bom_book.products))
+                raise InputProblem(i18n.Message(
+                    "err_product", text=self.product_text.get(),
+                    matches=i18n.Message("err_product_matches", count=len(matches)) if matches else
+                    i18n.Message("err_product_none")))
             if not any(s.name == self.stock_name.get() for s in self.stock_book.stock_sheets):
-                raise ValueError("请选择实际库存 Sheet；多个库存 Sheet 不会自动合并。")
-        except ValueError as exc:
+                raise InputProblem(i18n.Message("err_sheet"))
+        except InputProblem as exc:
             self.invalidate()
-            messagebox.showerror("输入待修正", str(exc), parent=self.root)
+            messagebox.showerror(self.t("title_input"), self.text(exc.message), parent=self.root)
             return
+        if trigger == "check":
+            self.show_page("check")  # the result appears on the shortage check page; Refresh stays where it is
         paths = {"stock": self.stock_path.get(), "bom": self.bom_path.get()}
         selected = {"stock": self.stock_name.get(), "bom": product.sheet_name}
         count = production_quantity(self.quantity_text.get())
@@ -1391,9 +1771,9 @@ class CheckerApp:
             sheet = self.service.find_stock_sheet(stock, selected["stock"])
             chosen = self.service.find_product(bom, selected["bom"])
             if sheet is None:
-                outcomes["stock"] = (None, (), DataReadError(SHEET_GONE), False)
+                outcomes["stock"] = (None, (), SheetGone(), False)
             if chosen is None:
-                outcomes["bom"] = (None, (), DataReadError(SHEET_GONE), False)
+                outcomes["bom"] = (None, (), SheetGone(), False)
             return outcomes, check_materials(chosen, sheet, count) if sheet and chosen else None
         def verify(data, report, attempt):
             """Worker thread, after the sync: does the result belong to the versions confirmed after it?"""
@@ -1427,6 +1807,9 @@ class CheckerApp:
         self.summary_counts["total"].set(str(len(result.rows)))
         for category in (SHORTAGE, EXCEPTION, ENOUGH):
             self.summary_counts[category].set(str(result.category_count(category)))
+        self.last_check = dict(result=result, product=result.product.display_name, quantity=result.production_count,
+                               time=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                               counts={c: result.category_count(c) for c in (SHORTAGE, EXCEPTION, ENOUGH)})
         if isinstance(bound, cached.CacheBinding):
             self.summary.set(cached.LABEL + "\n" + self.summary.get())
         elif bound is not None and not bound.current:
@@ -1486,7 +1869,7 @@ class CheckerApp:
         if self.busy:
             return
         if self.result is None:
-            messagebox.showerror("没有可导出的结果", "请先 CHECK。输入或文件变化后旧结果不会被导出。", parent=self.root)
+            messagebox.showerror(self.t("title_no_export"), self.t("err_no_result"), parent=self.root)
             return
         if not self._verify_export_sources():
             return
@@ -1495,22 +1878,20 @@ class CheckerApp:
         if isinstance(bound, cached.CacheBinding):
             name = 'UNVERIFIED_' + name
         # No overwrite prompt: an existing file is never replaced, a numbered name is used instead.
-        path = filedialog.asksaveasfilename(parent=self.root, title="导出为新的 Excel 报告", defaultextension=".xlsx",
+        path = filedialog.asksaveasfilename(parent=self.root, title=self.t("title_export"), defaultextension=".xlsx",
                                            filetypes=[("Excel (.xlsx)", "*.xlsx")], initialfile=name, confirmoverwrite=False)
         if path:
             if self.result is not result or self.result_binding is not bound or self.job != job:
-                messagebox.showerror("结果已变化", "选择导出位置期间 CHECK 结果已变化，请重新发起导出。", parent=self.root)
+                messagebox.showerror(self.t("title_changed"), self.t("err_result_changed"), parent=self.root)
                 return
             self.write_export(path)
 
     def _refuse_outdated_export(self, detail=""):
         if isinstance(self.result_binding, cached.CacheBinding):
-            messagebox.showerror(binding.OUTDATED, "历史缓存结果无法复核。请重新选择缓存并 CHECK，"
-                                 "或 Refresh Excel 重新读取源文件。\n" + detail, parent=self.root)
+            messagebox.showerror(binding.OUTDATED, self.t("err_cache_outdated", detail=detail), parent=self.root)
             return
-        messagebox.showerror(binding.OUTDATED,
-                             "此结果不能确认属于当前的本机 Storage / BOM 文件版本（源文件已变化或无法复核），不能导出为有效报告。"
-                             "请重新 CHECK。" + ("\n" + detail if detail else ""), parent=self.root)
+        messagebox.showerror(binding.OUTDATED, self.t("err_outdated", detail="\n" + detail if detail else ""),
+                             parent=self.root)
 
     def _export_sources(self):
         return {"stock": self.stock_path.get(), "bom": self.bom_path.get()}
@@ -1524,7 +1905,8 @@ class CheckerApp:
             self.summary.set(binding.OUTDATED + "\n" + self.summary.get())
         detail = "\n".join(part for part in (str(exc), getattr(exc, "cleanup_warning", "")) if part)
         status_detail = detail.replace("\n", " · ")
-        self.status.set(f"{binding.OUTDATED} · {status_detail} · {CLOUD_NOT_VERIFIED}")
+        self._set_status(i18n.Message("st_export_outdated", outdated=binding.OUTDATED, detail=status_detail,
+                                      cloud=CLOUD_NOT_VERIFIED))
         self._refuse_outdated_export(detail)
 
     def _verify_export_sources(self):
@@ -1561,7 +1943,8 @@ class CheckerApp:
         if not self.summary.get().startswith(binding.OUTDATED):
             self.summary.set(binding.OUTDATED + '\n' + self.summary.get())
         detail = '\n'.join(x for x in (str(exc), getattr(exc, 'cleanup_warning', '')) if x)
-        self.status.set(binding.OUTDATED + ' · ' + cached.LABEL + ' · Cloud Not Verified')
+        self._set_status(i18n.Message("st_cache_export_failed", outdated=binding.OUTDATED, label=cached.LABEL,
+                                      cloud=CLOUD_NOT_VERIFIED))
         self._refuse_outdated_export(detail)
 
     def write_export(self, path):
@@ -1588,16 +1971,16 @@ class CheckerApp:
             return None
         except (ReportError, OSError) as exc:
             detail = "\n".join(part for part in (str(exc), getattr(exc, "cleanup_warning", "")) if part)
-            if isinstance(exc, OSError):
-                detail = f"无法写入 {path}\n{detail}"
-            messagebox.showerror("导出失败", detail, parent=self.root)
+            message = (i18n.Message("err_write", path=path, detail=detail) if isinstance(exc, OSError) else
+                       i18n.Message("err_export", detail=detail))
+            messagebox.showerror(self.t("title_export_failed"), self.text(message), parent=self.root)
             return None
         self.export_path.set(str(written))
         self.hide_details()
         self.export_feedback.grid()
         self._resize()
-        self.status.set((cached.LABEL + " report exported · Cloud Not Verified")
-                        if isinstance(self.result_binding, cached.CacheBinding) else "Report exported successfully.")
+        self._set_status(i18n.Message("st_cache_exported", label=cached.LABEL)
+                         if isinstance(self.result_binding, cached.CacheBinding) else i18n.Message("st_exported"))
         return written
 
     def close(self):

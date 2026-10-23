@@ -372,8 +372,10 @@ class RetentionUiTests(History, UiBase):
                 with self.subTest(size=size,scale=scale):
                     self.root.tk.call('tk','scaling',96/72*scale)
                     self.root.geometry(f'{size[0]}x{size[1]}')
-                    self.root.update(); self.app._resize(); self.root.update()
-                    for button in (self.app.cache_button,self.app.maintenance_button):
+                    # B1: Use Cached Data is on the shortage check page, Local History on Settings.
+                    for page, button in (('settings', self.app.maintenance_button), ('check', self.app.cache_button)):
+                        self.app.show_page(page)
+                        self.root.update(); self.app._resize(); self.root.update()
                         self.assertTrue(button.winfo_ismapped())
                         self.assertLessEqual(button.winfo_rootx()+button.winfo_width(),
                                              self.root.winfo_rootx()+self.root.winfo_width())

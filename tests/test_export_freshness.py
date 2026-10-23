@@ -67,7 +67,7 @@ class ExportFreshnessTests(UiBase):
         with patch('checker.ui.filedialog.asksaveasfilename', side_effect=choose):
             self.app.export()
         self.assertFalse(self.target.exists())
-        self.assertIn('结果已变化', self.errors[-1])
+        self.assertIn('result changed while you chose the export location', self.errors[-1])  # B1: English interface
         self.assertEqual(self.app.result.production_count, 2)
 
     def test_selected_source_path_must_match_check_even_for_identical_bytes(self):

@@ -289,7 +289,7 @@ class UiTests(TempFiles):
         self.load_and_check(); away = self.base / 'away.bin'
         os.replace(self.stock, away)
         self.app.reload_button.invoke(); self.finish()
-        self.assertEqual(len(self.errors), 1); self.assertIn('库存 Excel', self.errors[0]); self.assertNotIn('BOM Excel', self.errors[0])
+        self.assertEqual(len(self.errors), 1); self.assertIn('Storage Excel', self.errors[0]); self.assertNotIn('BOM Excel', self.errors[0])  # B1: English interface
         self.assertIsNone(self.app.stock_book); self.assertIsNotNone(self.app.bom_book); self.assertIsNone(self.app.result)
         self.assertEqual(self.app.product_text.get(), self.app.bom_book.products[0].display_name)
         os.replace(away, self.stock)

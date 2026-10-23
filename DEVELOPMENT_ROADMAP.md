@@ -112,13 +112,13 @@ Also test turn-by-turn language switching, BOM/PCS/KG exclusions, ambiguous Mala
 - **Completed (source):** save the AI-reports daily/weekly preview as HTML + JSON (same report ID) without any AI call; optionally include an AI interpretation accepted for exactly those facts, as a separate UNVERIFIED section; write a local `.eml` draft (zh/en/ms) that attaches exactly that saved report. Saving re-checks the data basis under a held rollback-journal read lock and the assistant session under its lock right before one no-overwrite folder rename (the M3.2D publication contract).
 - **Verified this round:** synthetic data, temporary databases, fake transport; new delivery tests plus the directly affected M4F/M4E regressions (see `M4F_DELIVERY_TEST_REPORT.md`).
 - **Not executed:** real data, real API, real mail clients, network/cloud target folders, packaged EXE, other PCs, physical DPI.
-- **Remaining M4F work:** purchase-review suggestions, real sending/automatic notifications (with their own credential and authorisation design). The six UI concepts are under review; no new design was ported.
+- **Remaining M4F work:** purchase-review suggestions, real sending/automatic notifications (with their own credential and authorisation design). The user selected Claude's B1 light-blue workbench. Its Tkinter main shell, main-window dialog/status localisation and remembered interface language are implemented, source-reviewed and included in the local B1 commit. The narrow-screen last-trial counter clipping has been repaired with two focused layout checks; secondary-window localisation and final visual/packaged acceptance remain open. Round 2 has a non-blocking preference-recovery follow-up: selecting the already-active fallback language does not retry saving the preference.
 
 ## Phase 4 — Product Quality & Delivery
 
 | Workstream | Scope | Status |
 | --- | --- | --- |
-| UX / reliability finalization | Large-file background reads, export progress, cancellation, errors and compact-window layout | Further work planned; not M4B |
+| UX / reliability finalization | Large-file background reads, export progress, cancellation, errors and compact-window layout | B1 main shell, main-window three-language errors/status and remembered interface language source-reviewed and included in the local B1 commit; narrow last-trial counter clipping fixed. Secondary-window/some dialog/detail localisation remains partial. Same-language preference-save retry is a non-blocking P2. History worker bounds, background export and self-test failure-exit follow-ups remain open |
 | Security & data audit | API-key protection, allowlisted read-only tools, sensitive-data handling, spending limits and test coverage | Before AI-enabled delivery; final audit after M4 |
 | Real Drive validation | Actual Excel sync, unavailable/changing files, read-only protection and database parity | Targeted earlier evidence exists; full delivery matrix remains open |
 | Windows EXE acceptance | Windows 10/11, DPI, complete portable packaging and another PC | Expanded delivery matrix remains open |

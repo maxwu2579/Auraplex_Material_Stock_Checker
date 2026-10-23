@@ -492,10 +492,13 @@ class AlertUiTests(UiBase):
         self.start_app(); self.select_files()
         self.pump(lambda: 'active' in self.app.alert_text)
         self.root.deiconify()
-        self.root.geometry('960x600'); self.root.update(); self.app._resize(); self.root.update()
+        self.root.geometry('960x600')
+        self.app.show_page('alerts')  # B1: the alert entry line is on the Alerts page (count also in the sidebar)
+        self.root.update(); self.app._resize(); self.root.update()
         label = self.app.alerts_label
         self.assertTrue(label.winfo_ismapped())
         self.assertLessEqual(label.winfo_rootx() + label.winfo_width(), self.root.winfo_rootx() + self.root.winfo_width())
+        self.app.show_page('check'); self.root.update(); self.app._resize(); self.root.update()
         self.assertGreater(self.app.tree.winfo_height(), 60)
         self.app.open_alerts()
         window = self.app.alerts_window

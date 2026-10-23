@@ -418,8 +418,11 @@ class HistoryWindowTests(UiBase):
             with self.subTest(size=(width, height), scale=scale):
                 self.root.tk.call('tk', 'scaling', 96 / 72 * scale)
                 self.root.geometry(f'{width}x{height}')
-                self.root.update(); self.app._resize(); self.root.update()
-                for button in (self.app.history_button, self.app.maintenance_button, self.app.cache_button):
+                # B1: each entry is on its navigation page (Materials & history, Settings, shortage check).
+                for page, button in (('materials', self.app.history_button), ('settings', self.app.maintenance_button),
+                                     ('check', self.app.cache_button)):
+                    self.app.show_page(page)
+                    self.root.update(); self.app._resize(); self.root.update()
                     self.assertTrue(button.winfo_ismapped())
                     self.assertLessEqual(button.winfo_rootx() + button.winfo_width(),
                                          self.root.winfo_rootx() + self.root.winfo_width())

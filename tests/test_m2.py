@@ -304,12 +304,12 @@ class UiFlowTests(Files):
         self.load()
         self.assertEqual(tuple(self.app.product_combo['values']), ('DEMO-200-A-40W', 'DEMO-200-A-25W', 'KIT-115'))
         self.check('demo-200')  # two candidates: no calculation, candidates offered
-        self.assertIsNone(self.app.result); self.assertIn('2 个匹配项', self.errors[-1])
+        self.assertIsNone(self.app.result); self.assertIn('2 matches', self.errors[-1])  # B1: English interface
         self.assertEqual(tuple(self.app.product_combo['values']), ('DEMO-200-A-40W', 'DEMO-200-A-25W'))
         self.check('kit')  # one candidate is still only typed text, not a selection
         self.assertIsNone(self.app.result); self.assertEqual(len(self.errors), 2)
         self.check('NOT-A-PRODUCT')
-        self.assertIsNone(self.app.result); self.assertIn('没有匹配', self.errors[-1]); self.assertFalse(self.app.busy)
+        self.assertIsNone(self.app.result); self.assertIn('No Product ID in the BOM matches', self.errors[-1]); self.assertFalse(self.app.busy)
         self.app.product_text.set('kit'); self.app._pick()  # Enter with one candidate selects it
         self.assertEqual(self.app.product_text.get(), 'KIT-115')
         self.app.product_text.set('demo'); self.app.product_combo.event_generate = lambda *a, **k: None; self.app._pick()

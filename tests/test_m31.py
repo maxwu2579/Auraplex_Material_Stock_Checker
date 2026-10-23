@@ -759,7 +759,7 @@ class InventoryUiTests(UiBase):
         os.replace(self.stock, self.base / 'away.bin')
         app = self.start_app()
         self.assertEqual(len(self.errors), 1)
-        self.assertIn('数据库保留此前同步的数据', self.errors[0]); self.assertIn('当前未验证', self.errors[0])
+        self.assertIn('keeps the previously synchronised data', self.errors[0]); self.assertIn('not verified now', self.errors[0])  # B1: English interface
         self.assertIn('Refresh Excel', self.errors[0])
         self.assertEqual(app.db_status.get(), f'Status: {USING_PREVIOUS}')
         self.assertIn(f'{SOURCE_UNAVAILABLE} · {USING_PREVIOUS}', app.db_role_text['stock'].get())
@@ -822,7 +822,7 @@ class InventoryUiTests(UiBase):
         self.assertIn('Last Verified: —', app.db_times.get())  # no time that cannot be read reliably
         self.assertEqual({v.get() for v in app.db_role_text.values()}, {f'Storage: {STATUS_UNKNOWN}', f'BOM: {STATUS_UNKNOWN}'})
         self.assertIn('database disk image is malformed', app._inventory_details())
-        self.assertEqual(len(self.warnings), 1); self.assertIn('状态读取失败', self.warnings[0])
+        self.assertEqual(len(self.warnings), 1); self.assertIn('status could not be read', self.warnings[0])
         self.assertIsNotNone(app.result)  # the Excel-based check itself is unaffected
         self.assertEqual([r['qty_value'] for r in self.read(current_stock)], ['100', '5', '0'])  # data preserved
         app.refresh_button.invoke(); self.finish()  # the database is readable again
@@ -973,10 +973,10 @@ class CheckBindingTests(UiBase):
         self.assertTrue(app.export_button.instate(['disabled']))
         target = self.base / 'outdated.xlsx'
         self.assertIsNone(app.write_export(str(target))); self.assertFalse(target.exists())
-        self.assertIn('不能导出为有效报告', self.errors[-1])
+        self.assertIn('cannot be exported as a valid report', self.errors[-1])  # B1: English interface
         with patch('checker.ui.filedialog.asksaveasfilename', side_effect=AssertionError('no save dialog')):
             app.export()
-        self.assertEqual(len([e for e in self.errors if '不能导出为有效报告' in e]), 2)
+        self.assertEqual(len([e for e in self.errors if 'cannot be exported as a valid report' in e]), 2)
 
     def test_check_with_old_storage_then_new_storage_synchronised_is_recalculated(self):
         guard, calls = self.save_after_calculation('stock', [('A', 3), ('B', 5), ('C', 0)])
@@ -1138,7 +1138,7 @@ class FailureOverrideTests(UiBase):
         self.assertEqual(self.read(bom_lines, 'PRODUCT-1')[0]['qty'], 3)  # BOM imported independently
         self.assertEqual([r['qty_value'] for r in self.read(current_stock)], ['100', '5', '0'])
         self.assertIsNone(self.app.result)  # Storage could not be read: no result at all
-        self.assertTrue(any('本次失败未能写入数据库记录' in e for e in self.errors))
+        self.assertTrue(any('could not be written to the database record' in e for e in self.errors))  # B1: English interface
 
     def test_failure_during_startup_sync_is_not_hidden_by_old_success(self):
         os.replace(self.stock, self.base / 'away.bin')

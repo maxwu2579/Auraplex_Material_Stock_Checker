@@ -60,7 +60,7 @@ class TkWorkflowTests(unittest.TestCase):
 
     def test_nonexistent_product_and_invalid_quantity_block_check(self):
         self.load();self.app.product_text.set('invented');self.app.check_button.invoke()
-        self.assertIsNone(self.app.result);self.assertIn('实际存在',self.errors[-1])
+        self.assertIsNone(self.app.result);self.assertIn('choose an existing product',self.errors[-1])  # B1: English interface
         self.app.product_combo.current(0);self.app.quantity_text.set('0');self.app.check_button.invoke()
         self.assertIn('正整数',self.errors[-1]);self.assertFalse(self.app.busy)
 

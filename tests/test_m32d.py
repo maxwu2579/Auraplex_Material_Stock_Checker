@@ -804,13 +804,13 @@ class DailyWindowTests(SessionUiBase):
     def test_entry_and_window_fit_small_windows(self):
         self.current_session()
         self.root.deiconify()
-        self.root.geometry('960x600'); self.root.update(); self.app._resize(); self.root.update()
-        link, buttons = self.app.daily_link, self.app.history_button.master
+        self.root.geometry('960x600')
+        self.app.show_page('daily')  # B1: the entry is on the Daily summary page (no shared header row any more)
+        self.root.update(); self.app._resize(); self.root.update()
+        link = self.app.daily_link
         self.assertTrue(link.winfo_ismapped())
         self.assertLessEqual(link.winfo_rootx() + link.winfo_width(), self.root.winfo_rootx() + self.root.winfo_width())
-        # The link shares the alert line: the top-right area is no wider than the button row, so the title keeps
-        # exactly the room it had before M3.2D.
-        self.assertLessEqual(link.master.winfo_reqwidth(), buttons.winfo_reqwidth())
+        self.assertLessEqual(link.winfo_rooty() + link.winfo_height(), self.root.winfo_rooty() + self.root.winfo_height())
         window = self.open()
         for size in ('760x480', '960x600', '1280x720'):
             window.top.geometry(size)
