@@ -2,7 +2,8 @@
 
 Queries run on worker threads and return through a queue; only this module's Tk thread touches widgets. Each search
 and each query carries a generation number: a slower, older response can never replace a newer one, and nothing is
-delivered after the window is closed. The banner "HISTORICAL OBSERVATIONS · Not current stock · Cloud Not Verified"
+delivered after the window is closed. Work is bounded per kind of request (see `_Lane`): typing or clicking fast never
+starts a thread per request, a superseded query stops cooperatively, and closing the window starts nothing more. The banner "HISTORICAL OBSERVATIONS · Not current stock · Cloud Not Verified"
 is permanent; this window never shows "Local Sources Verified".
 """
 from __future__ import annotations
@@ -47,6 +48,50 @@ def side_text(status, raw):
     return value if status == "VALID" else f"{value} ({STATUS_TEXT.get(status, status)})"
 
 
+class _Lane:
+    """Bounded background work for one kind of request (Storage Sheets, search or query); Tk thread only.
+
+    The newest request is the only current one. It cancels the running job cooperatively and starts at once, unless an
+    earlier cancelled job is still finishing; then it waits as the single pending request, which a newer request
+    replaces. A lane therefore never runs more than LIMIT threads (the current job and one finishing) and holds at most
+    one pending request, however fast the user types or clicks. Threads are never killed."""
+    LIMIT = 2
+
+    def __init__(self, kind, start):
+        self.kind, self.start = kind, start   # start(kind, generation, action, cancel) runs one worker thread
+        self.active = []                      # cancel events of the running jobs, oldest first
+        self.pending = None                   # (generation, action) waiting for a free thread
+        self.started = 0
+
+    def submit(self, generation, action):
+        self.cancel_running()
+        self.pending = (generation, action)
+        self._next()
+
+    def finished(self, cancel):
+        if cancel in self.active:
+            self.active.remove(cancel)
+        self._next()
+
+    def stop(self):
+        """Nothing pending starts any more; running jobs are asked to stop."""
+        self.pending = None
+        self.cancel_running()
+
+    def cancel_running(self):
+        for cancel in self.active:
+            cancel.set()
+
+    def _next(self):
+        if self.pending is None or len(self.active) >= self.LIMIT:
+            return
+        (generation, action), self.pending = self.pending, None
+        cancel = threading.Event()
+        self.active.append(cancel)
+        self.started += 1
+        self.start(self.kind, generation, action, cancel)
+
+
 def signed(text):
     try:
         value = Decimal(text)
@@ -67,6 +112,7 @@ class HistoryWindow:
         self.candidates = []
         self.shown = {"records": 0, "changes": 0}
         self._search_job = None
+        self.lanes = {kind: _Lane(kind, self._start) for kind in ("sheets", "search", "query")}
         self.top = top = tk.Toplevel(master)
         top.title("Inventory History — Historical Observations")
         left, upper, width, height = work_area(top)
@@ -216,12 +262,16 @@ class HistoryWindow:
 
     # ------------------------------------------------------------------ worker plumbing
     def _run(self, kind, generation, action):
+        self.lanes[kind].submit(generation, action)
+
+    def _start(self, kind, generation, action, cancel):
         def worker():
             try:
-                data, error = action(), None
+                with history.cancellable(cancel):
+                    data, error = action(), None
             except Exception as exc:  # delivered to the Tk thread; never touches widgets here
                 data, error = None, exc
-            self.events.put((kind, generation, data, error))
+            self.events.put((kind, generation, cancel, data, error))
         threading.Thread(target=worker, daemon=True, name=f"m4a-history-{kind}").start()
 
     def _poll(self):
@@ -229,9 +279,10 @@ class HistoryWindow:
             return
         while True:
             try:
-                kind, generation, data, error = self.events.get_nowait()
+                kind, generation, cancel, data, error = self.events.get_nowait()
             except queue.Empty:
                 break
+            self.lanes[kind].finished(cancel)  # frees the thread slot; the pending request (if any) starts now
             if kind == "sheets":
                 self._sheets_loaded(data, error)
             elif kind == "search" and generation == self.search_gen:
@@ -245,6 +296,8 @@ class HistoryWindow:
         if self.closed:
             return
         self.closed = True  # late worker responses stay in the queue and are never applied
+        for lane in self.lanes.values():
+            lane.stop()  # no pending request starts after closing; running reads stop at their next check
         for job in (self.poll_id, self._search_job):
             if job is not None:
                 try:
@@ -287,6 +340,7 @@ class HistoryWindow:
         self.candidates = []
         self.candidate_list.delete(0, "end")
         if not text.strip():
+            self.lanes["search"].stop()  # an earlier search is no longer wanted
             self.candidate_note.configure(text="Type part of a Material ID, then select one exact ID.", foreground=MUTED)
             return
         self.candidate_note.configure(text="Searching…", foreground=MUTED)

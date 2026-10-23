@@ -278,9 +278,24 @@ class CheckerApp:
         label.configure(text=text)
 
     def set_language(self, language):
-        """Interface language only: no Excel read, sync, AI call or permission change; inputs, results, filters and
-        running jobs are untouched (the Tk variables and objects stay the same)."""
+        """An explicit language choice. A new language re-renders the interface; choosing the current one re-renders
+        nothing and only retries remembering it (after a corrupt or unwritable preference file). Interface language
+        only: no Excel read, sync, AI call or permission change; inputs, results, filters and running jobs are
+        untouched (the Tk variables and objects stay the same)."""
+        if language not in i18n.LANGUAGES:
+            return
         self.language.set(language)
+        self._remember_language()
+
+    def _remember_language(self):
+        """Save the current language to the interface preference file (never the source-path settings)."""
+        if self.preferences is not None:
+            try:
+                self.preferences.save(self.language.language)
+                self.preference_error = self.preference_problem = None
+            except OSError as exc:  # this session keeps the language; nothing else depends on the file
+                self.preference_error = f"{type(exc).__name__}: {exc}"
+        self._render_preference()
 
     def _language_changed(self, _language):
         for widget, key, option, values in list(self.i18n_bindings):
@@ -300,13 +315,7 @@ class CheckerApp:
             self._refresh_file_card(role)
         self.home.render()
         self.status.set(self.text(self.status_message))
-        if self.preferences is not None:
-            try:
-                self.preferences.save(self.language.language)
-                self.preference_error = self.preference_problem = None
-            except OSError as exc:  # this session keeps the language; nothing else depends on the file
-                self.preference_error = f"{type(exc).__name__}: {exc}"
-        self._render_preference()
+        self._render_preference()  # saving is the explicit choice's job (set_language), not the change notification
         self._schedule_resize()
 
     def _build_sidebar(self, shell):

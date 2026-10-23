@@ -11,6 +11,7 @@ are counted so the UI can say what was not loaded. The database is never created
 from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import json
@@ -46,6 +47,41 @@ class HistoryReadError(HistoryError):
     """The database could not be read safely; nothing from this query may be shown as a result."""
 
 
+class HistoryCancelled(HistoryError):
+    """A newer request (or closing the window) superseded this query; it stopped early and has no result."""
+
+
+_CANCEL = ContextVar("history_cancel", default=None)
+PROGRESS_STEPS = 1000     # SQLite steps between cancellation checks inside one statement
+
+
+@contextmanager
+def cancellable(event):
+    """Reads started in this block (on this thread) stop cooperatively once `event` is set: before each statement and
+    every PROGRESS_STEPS SQLite steps within one. Nothing is killed; the read transaction ends and the connection
+    closes as usual. Without this block read_view behaves exactly as before."""
+    token = _CANCEL.set(event)
+    try:
+        yield
+    finally:
+        _CANCEL.reset(token)
+
+
+class _Cancellable:
+    """The read_view connection, checking the cancel event before each statement."""
+
+    def __init__(self, conn, event):
+        self._conn, self._event = conn, event
+
+    def execute(self, *args):
+        if self._event.is_set():
+            raise HistoryCancelled("History query superseded; no result.")
+        return self._conn.execute(*args)
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
 def _checkpoint(stage: str) -> None:
     """Test hook between the steps of one query (all steps share one read transaction)."""
 
@@ -56,20 +92,26 @@ def read_view(database):
 
     A missing file is refused (never created); a foreign or newer schema is refused."""
     path = Path(database)
-    conn = None
+    conn, cancel = None, _CANCEL.get()
     try:
+        if cancel is not None and cancel.is_set():
+            raise HistoryCancelled("History query superseded; no result.")
         if not path.is_file():
             raise HistoryReadError(f"Inventory database not found: {path}")
         conn = open_readonly(path)
+        if cancel is not None:
+            conn.set_progress_handler(cancel.is_set, PROGRESS_STEPS)
         conn.execute("PRAGMA busy_timeout = 1500")
         conn.execute("BEGIN")
         if conn.execute("PRAGMA user_version").fetchone()[0] not in SUPPORTED_SCHEMA_VERSIONS:
             raise HistoryReadError("Unsupported inventory database schema; history query refused.")
         conn.execute("SELECT count(*) FROM inventory_snapshots").fetchone()  # starts the read snapshot
-        yield conn
+        yield conn if cancel is None else _Cancellable(conn, cancel)
     except HistoryError:
         raise
     except (OSError, sqlite3.Error, ValueError, TypeError, LookupError, ArithmeticError) as exc:
+        if cancel is not None and cancel.is_set():  # interrupted by the progress handler, not a read failure
+            raise HistoryCancelled("History query superseded; no result.") from exc
         # Unreadable or inconsistent stored content is a read failure too, never a partial result.
         raise HistoryReadError(f"Inventory database cannot be read: {exc}") from exc
     finally:
