@@ -19,7 +19,8 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 
-from . import alerts
+from . import alerts, i18n
+from .alerts_i18n import TEXT, message
 from .core import display, normalize_code
 from .history_ui import side_text, signed
 from .inventory_db import decode, parse_stamp
@@ -61,6 +62,8 @@ class AlertsWindow:
     def __init__(self, master, owner):
         """owner: the CheckerApp (database path, session verification state, evaluation request, upgrade)."""
         self.owner = owner
+        self._messages = {}
+        self._status_message = message("Loading stock alerts… · Cloud Not Verified")
         self.database = str(owner.inventory.db_path)
         self.events = queue.Queue()
         self.closed = False
@@ -78,9 +81,67 @@ class AlertsWindow:
         top.configure(background=BG)
         top.protocol("WM_DELETE_WINDOW", self.close)
         self._build()
+        self._register_labels()
+        self.language_changed()
         self.poll_id = top.after(50, self._poll)
         self.show_session_state()
         self.reload()
+
+    def text(self, value):
+        return i18n.render(value, self.owner.language.language)
+
+    def _remember(self, widget, value):
+        self._messages[widget] = value
+        widget.configure(text=self.text(value))
+
+    def _set_status(self, value):
+        self._status_message = value
+        self.status.set(self.text(value))
+
+    def _register_labels(self):
+        # Known construction-time interface strings only, never table values or source notes.
+        pending = [self.top]
+        while pending:
+            widget = pending.pop()
+            try:
+                value = str(widget.cget("text"))
+                variable = str(widget.cget("textvariable"))
+                if not variable:
+                    if value in TEXT:
+                        self._messages[widget] = message(value)
+                    elif value in (f"{days} days" for days in alerts.CHANGE_RANGES):
+                        self._messages[widget] = message("{days} days", days=int(value.split()[0]))
+            except tk.TclError:
+                pass
+            pending.extend(widget.winfo_children())
+        self._headings = {(name, column): tree.heading(column, "text")
+                          for name, tree in self.trees.items() for column in tree["columns"]}
+
+    def language_changed(self):
+        """Display the same observations in another language; never reload, filter or evaluate."""
+        if self.closed:
+            return
+        self.top.title(self.text(message("Stock Alerts — synchronised data")))
+        for widget, value in self._messages.items():
+            if widget in (self.basis, self.details):
+                widget.configure(state="normal")
+                widget.delete("1.0", "end")
+                widget.insert("end", self.text(value))
+                widget.configure(state="disabled")
+            else:
+                widget.configure(text=self.text(value))
+        self.status.set(self.text(self._status_message))
+        for (name, column), template in self._headings.items():
+            self.trees[name].heading(column, text=self.text(message(template)))
+        for index, title in ((0, "Alerts"), (1, "Observed Changes")):
+            self.tabs.tab(index, text=self.text(message(title)))
+        for combo, template in ((self.sheet_combo, ALL_SHEETS), (self.type_combo, ALL),
+                                (self.change_combo, CHANGE_TYPES[0])):
+            selected = combo.current()
+            values = tuple(combo["values"])
+            combo.configure(values=(self.text(message(template)), *values[1:]))
+            if selected >= 0:
+                combo.current(selected)
 
     # ------------------------------------------------------------------ layout
     def _build(self):
@@ -183,7 +244,7 @@ class AlertsWindow:
         self.status = tk.StringVar(value="Loading stock alerts… · Cloud Not Verified")
         self.status_label = ttk.Label(outer, textvariable=self.status, font=("Segoe UI", 9), foreground=MUTED)
         self.status_label.grid(row=7, sticky="w", pady=(4, 0))
-        self._set_text(self.details, DETAILS_HINT)
+        self._set_text(self.details, message(DETAILS_HINT))
         self.top.bind("<Configure>", self._fit, add="+")
 
     def _fit(self, event=None):
@@ -243,15 +304,16 @@ class AlertsWindow:
             return
         self.loading[kind] = True
         include, days = self.show_resolved.get(), self.days.get()
+        database, events = self.database, self.events  # do not retain the Tk window until worker-thread teardown
 
         def worker():
             try:
-                data = (alerts.load_state(self.database, include_resolved=include) if kind == "alerts"
-                        else alerts.observed_changes_view(self.database, days))
+                data = (alerts.load_state(database, include_resolved=include) if kind == "alerts"
+                        else alerts.observed_changes_view(database, days))
                 error = None
             except Exception as exc:
                 data, error = None, exc
-            self.events.put((kind, data, error))
+            events.put((kind, data, error))
         threading.Thread(target=worker, daemon=True, name=f"m32c-alerts-{kind}").start()
 
     def _poll(self):
@@ -296,7 +358,7 @@ class AlertsWindow:
     # ------------------------------------------------------------------ actions
     def evaluate(self):
         self.owner.request_alerts("manual")
-        self.status.set("Evaluation requested · Cloud Not Verified")
+        self._set_status(message("Evaluation requested · Cloud Not Verified"))
 
     def upgrade(self):
         self.owner.preview_upgrade()
@@ -307,21 +369,19 @@ class AlertsWindow:
         if self.closed:
             return
         if self.owner.alert_current:
-            self.session.configure(text="Re-checked in this session: the alerts of the current files come from a "
-                                        "verified evaluation of the files this program has just checked.",
-                                   foreground="#3b715e")
+            self._remember(self.session, message("Re-checked in this session: the alerts of the current files come from a verified evaluation of the files this program has just checked."))
+            self.session.configure(foreground="#3b715e")
         else:
-            prefix = ("DATABASE READ FAILED · " if self.owner.alert_read_error is not None else "")
-            self.session.configure(text=prefix + "NOT RE-CHECKED IN THIS SESSION — " +
-                                        (self.owner.alert_reason or "unknown") +
-                                        ". The alerts below are stored results of earlier evaluations and may be out "
-                                        "of date; nothing is marked recovered until a verified evaluation.",
-                                   foreground="#b00020")
+            prefix = message("DATABASE READ FAILED · ") if self.owner.alert_read_error is not None else ""
+            self._remember(self.session, message("{prefix}NOT RE-CHECKED IN THIS SESSION — {reason}. The alerts below are stored results of earlier evaluations and may be out of date; nothing is marked recovered until a verified evaluation.",
+                                                 prefix=prefix, reason=self.owner.alert_reason or message("unknown")))
+            self.session.configure(foreground="#b00020")
 
     def _set_text(self, widget, text, error=False):
+        self._messages[widget] = text
         widget.configure(state="normal")
         widget.delete("1.0", "end")
-        widget.insert("end", text)
+        widget.insert("end", self.text(text))
         widget.configure(state="disabled", foreground="#b00020" if error else
                          (MUTED if widget is self.details else INK))
 
@@ -333,30 +393,25 @@ class AlertsWindow:
             self.owner.alert_read_failed(error)
             self.visible["alerts"] = ()
             self._clear("alerts")
-            self._set_text(self.basis, "STOCK ALERTS COULD NOT BE READ — nothing is shown. Earlier alerts were "
-                                       f"cleared from this window, not from the database.\n{error}", error=True)
-            self.status.set("Read failed · no alerts shown · Cloud Not Verified")
+            self._set_text(self.basis, message("STOCK ALERTS COULD NOT BE READ — nothing is shown. Earlier alerts were cleared from this window, not from the database.\n{error}", error=str(error)), error=True)
+            self._set_status(message("Read failed · no alerts shown · Cloud Not Verified"))
             return
         self.state = state
         self.owner.alert_read_ok()
         self.show_session_state()
         if state.schema < alerts.ALERT_SCHEMA_VERSION:
             self.upgrade_button.pack(side="right", padx=(0, 8))
-            self._set_text(self.basis, f"Stock alerts need a one-time upgrade of the local database (schema "
-                                       f"{state.schema} → {alerts.ALERT_SCHEMA_VERSION}). Nothing changes until you "
-                                       "confirm the preview; a verified backup is made first. All other functions work "
-                                       "without it.")
+            self._set_text(self.basis, message("Stock alerts need a one-time upgrade of the local database (schema {schema} → {required}). Nothing changes until you confirm the preview; a verified backup is made first. All other functions work without it.", schema=state.schema, required=alerts.ALERT_SCHEMA_VERSION))
             self.visible["alerts"] = ()
             self._clear("alerts")
-            self.status.set("Upgrade required · Cloud Not Verified")
+            self._set_status(message("Upgrade required · Cloud Not Verified"))
             return
         self.upgrade_button.pack_forget()
         self._set_text(self.basis, self._basis_text(state))
         self._refresh_sheets()
         self._apply_filters("alerts")
-        self.status.set(f"{sum(state.active_counts.values())} active alerts for the current files"
-                        f"{f' · {state.other_sources_active} of other source files' if state.other_sources_active else ''}"
-                        " · from synchronised data · Cloud Not Verified")
+        self._set_status(message("{count} active alerts for the current files{other} · from synchronised data · Cloud Not Verified",
+                                 count=sum(state.active_counts.values()), other=message(" · {count} of other source files", count=state.other_sources_active) if state.other_sources_active else ""))
 
     def _changes_loaded(self, view, error):
         self.changes = None
@@ -364,8 +419,8 @@ class AlertsWindow:
             self.owner.alert_read_failed(error)
             self.visible["changes"] = ()
             self._clear("changes")
-            self.count_labels["changes"].configure(text=f"Observed changes could not be read; none shown: {error}",
-                                                   foreground="#b00020")
+            self._remember(self.count_labels["changes"], message("Observed changes could not be read; none shown: {error}", error=str(error)))
+            self.count_labels["changes"].configure(foreground="#b00020")
             return
         self.changes = view
         self._refresh_sheets()
@@ -417,7 +472,7 @@ class AlertsWindow:
                          "re-checked and are not recovered (Show other source files).")
         if state.total_rows > len(state.rows):
             lines.append(f"Only the first {len(state.rows)} of {state.total_rows} alerts were loaded.")
-        return "\n".join(lines)
+        return i18n.Join((message(RULES), message("Original evaluation details (unchanged):"), "\n".join(lines[1:])), "\n")
 
     def _refresh_sheets(self):
         names = set()
@@ -425,11 +480,11 @@ class AlertsWindow:
             names.update(r.stock_sheet for r in self.state.rows)
         if self.changes is not None:
             names.update(c.sheet for _key, c in self.changes.rows)
-        self.sheet_combo.configure(values=(ALL_SHEETS, *sorted(names)))
+        self.sheet_combo.configure(values=(self.text(message(ALL_SHEETS)), *sorted(names)))
 
     def _matches(self, sheet, key):
         wanted_sheet, text = self.sheet_filter.get(), normalize_code(self.material_filter.get())
-        return (wanted_sheet == ALL_SHEETS or sheet == wanted_sheet) and (not text or text in (key or ""))
+        return (self.sheet_combo.current() == 0 or sheet == wanted_sheet) and (not text or text in (key or ""))
 
     def _apply_filters(self, kind=None):
         for name in ((kind,) if kind else ("alerts", "changes")):
@@ -438,7 +493,7 @@ class AlertsWindow:
                     continue
                 wanted = self.type_filter.get()
                 rows = tuple(r for r in self.state.rows
-                             if (wanted == ALL or LABELS[r.alert_type] == wanted)
+                             if (self.type_combo.current() == 0 or LABELS[r.alert_type] == wanted)
                              and (r.in_scope or self.show_other.get() or r.status == alerts.RESOLVED)
                              and self._matches(r.stock_sheet, r.material_key))
             else:
@@ -446,7 +501,7 @@ class AlertsWindow:
                     continue
                 wanted = self.change_filter.get()
                 rows = tuple((key, c) for key, c in self.changes.rows
-                             if (wanted == CHANGE_TYPES[0] or c.change_type == wanted) and self._matches(c.sheet, key))
+                             if (self.change_combo.current() == 0 or c.change_type == wanted) and self._matches(c.sheet, key))
             self.visible[name] = rows
             self._clear(name)
             self._render_page(name)
@@ -456,8 +511,9 @@ class AlertsWindow:
         tree.delete(*tree.get_children())
         self.shown[name] = 0
         self.more_buttons[name].grid_remove()
-        self.count_labels[name].configure(text="", foreground=MUTED)
-        self._set_text(self.details, DETAILS_HINT)
+        self._remember(self.count_labels[name], "")
+        self.count_labels[name].configure(foreground=MUTED)
+        self._set_text(self.details, message(DETAILS_HINT))
 
     def _render_page(self, name):
         rows, start = self.visible[name], self.shown[name]
@@ -471,12 +527,14 @@ class AlertsWindow:
         else:
             total = self.changes.total if self.changes else 0
             loaded = len(self.changes.rows) if self.changes else 0
-        text = f"Showing {self.shown[name]} of {len(rows)} (filtered from {loaded} loaded"
-        text += f"; {total} in total — narrow the filters)" if total > loaded else ")"
+        limit = message("; {total} in total — narrow the filters", total=total) if total > loaded else ""
+        text = message("Showing {shown} of {filtered} (filtered from {loaded} loaded{limit})",
+                       shown=self.shown[name], filtered=len(rows), loaded=loaded, limit=limit)
         if name == "changes" and self.changes is not None:
-            text += (f" · {self.changes.days} days from {local(self.changes.window_start)} · current Storage file only"
-                     + ("".join(" · " + n for n in self.changes.notes)))
-        self.count_labels[name].configure(text=text)
+            text = i18n.Join((text, message(" · {days} days from {start} · current Storage file only",
+                                           days=self.changes.days, start=local(self.changes.window_start)),
+                              *(" · " + n for n in self.changes.notes)), "")
+        self._remember(self.count_labels[name], text)
         if self.shown[name] < len(rows):
             self.more_buttons[name].grid()
         else:

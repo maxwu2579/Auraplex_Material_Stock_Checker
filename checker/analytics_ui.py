@@ -5,7 +5,9 @@ import threading
 import tkinter as tk
 from tkinter import ttk
 
-from . import analytics
+from . import analytics, i18n
+from .analysis_daily_i18n import TEXT, message
+from .window_language import WindowLanguage
 from .core import display
 from .daily import DailyRunner
 from .history import HistoryReadError
@@ -19,7 +21,8 @@ def number(value):
 
 
 class AnalyticsWindow:
-    def __init__(self, master, database, on_close=None, on_read_error=None):
+    def __init__(self, master, database, on_close=None, on_read_error=None, *, language=None):
+        self.locale = WindowLanguage(language if language is not None else i18n.LanguageState(), TEXT, message)
         self.database = str(database)
         self.on_close, self.on_read_error = on_close, on_read_error
         self.closed = False
@@ -36,7 +39,23 @@ class AnalyticsWindow:
         top.configure(background=BG)
         top.protocol('WM_DELETE_WINDOW', self.close)
         self._build()
+        self.locale.register(self.top, (self.tree,))
+        self._set_status(message("Historical observations only · Cloud Not Verified"))
+        self.language_changed()
         self.poll_id = top.after(50, self._poll)
+
+    def language_changed(self):
+        if self.closed:
+            return
+        self.top.title(self.locale.text(message('Inventory Analytics — Historical / UNVERIFIED')))
+        self.locale.render()
+        # Re-render only already displayed cells; no query, generation change or page advance.
+        if self.result is not None:
+            for item in self.tree.get_children():
+                self.tree.item(item, values=self._row_values(self.result.materials[int(item)]))
+
+    def _set_status(self, value):
+        self.locale.status(self.status, value)
 
     def _build(self):
         outer = ttk.Frame(self.top, padding=(12, 8))
@@ -107,8 +126,9 @@ class AnalyticsWindow:
         self.more = ttk.Button(footer,text='Show more',command=self._page,padding=(8,1),state='disabled')
         self.more.grid(row=0,column=1,padx=(6,0))
         ttk.Button(footer,text='Close',command=self.close,padding=(8,1)).grid(row=0,column=2,padx=(6,0))
-        for variable in (self.days,self.material_text,self.sheet,self.minimum_days,self.low_movement,self.percent):
-            variable.trace_add('write',self._edited)
+        self._option_traces = [(variable, variable.trace_add('write', self._edited))
+                               for variable in (self.days, self.material_text, self.sheet, self.minimum_days,
+                                                self.low_movement, self.percent)]
         self.top.bind('<Configure>',self._fit,add='+')
 
     def _fit(self,event=None):
@@ -122,12 +142,10 @@ class AnalyticsWindow:
             self.coverage.configure(height=3)
             self.details.configure(height=3)
 
-    @staticmethod
-    def _text(widget,text):
-        widget.configure(state='normal')
-        widget.delete('1.0','end')
-        widget.insert('1.0',text)
-        widget.configure(state='disabled')
+    def _text(self, widget, text):
+        if isinstance(text, str) and text in TEXT:
+            text = message(text)
+        self.locale.body(widget, text)
 
     def _clear(self):
         self.result = None
@@ -143,7 +161,7 @@ class AnalyticsWindow:
         self.cancel.set()
         self._clear()
         self._text(self.coverage,'Options changed; previous analysis discarded. Analyze again.')
-        self.status.set('Options changed · Analyze again · Cloud Not Verified')
+        self._set_status(message('Options changed · Analyze again · Cloud Not Verified'))
 
     def query(self):
         if self.closed:
@@ -153,22 +171,22 @@ class AnalyticsWindow:
             days = int(self.days.get())
             policy = analytics.Policy(int(self.minimum_days.get()),self.low_movement.get(),self.percent.get())
             if days not in analytics.RANGES:
-                raise ValueError('Choose 30, 60 or 90 days.')
+                raise ValueError(self.locale.text(message('Choose 30, 60 or 90 days.')))
         except (ValueError,analytics.AnalyticsError) as exc:
-            self.status.set('Invalid options')
+            self._set_status(message('Invalid options'))
             self._text(self.coverage,str(exc))
             return
         generation = self.generation
         cancel = self.cancel = threading.Event()
         database, sheet, text = self.database, self.sheet.get() or None, self.material_text.get()
-        self.status.set('Analyzing… · Cloud Not Verified')
+        self._set_status(message('Analyzing… · Cloud Not Verified'))
         self._text(self.coverage,'Reading one consistent historical database view…')
         self.runner.request(generation,'analysis',lambda:analytics.analyze(database,days,sheet,text,policy=policy,cancel=cancel))
 
     def stop(self):
         self._edited()
         if not self.closed:
-            self.status.set('Cancelled · no result shown · Cloud Not Verified')
+            self._set_status(message('Cancelled · no result shown · Cloud Not Verified'))
             self._text(self.coverage,'Analysis cancelled. No result is shown.')
 
     def _poll(self):
@@ -181,19 +199,20 @@ class AnalyticsWindow:
                     continue
                 if error is not None:
                     self._clear()
-                    self.status.set('QUERY FAILED · no result shown · Cloud Not Verified')
+                    self._set_status(message('QUERY FAILED · no result shown · Cloud Not Verified'))
                     self._text(self.coverage,str(error))
                     if isinstance(error,HistoryReadError) and self.on_read_error is not None:
                         self.on_read_error(error)
                     continue
                 self.result = result
                 self.sheet_combo.configure(values=('',*result.sheet_names))
-                summary = (f'{len(result.materials)} material/source groups · {result.snapshots_in_window} snapshots in window · '
-                           f'{result.start} → {result.evaluated_at} UTC\n'
-                           f'Rules: span ≥ {result.policy.minimum_days} days, movement ≤ {result.policy.low_movement}, '
-                           f'large step ≥ {result.policy.large_change_percent}%. Unkeyed historical rows excluded: {result.unkeyed_rows}.\n'
-                           '* Movement sums comparable intervals only; net is unknown across gaps. ')
-                self._text(self.coverage,summary+' '.join(result.notes))
+                summary = message('{count} material/source groups · {snapshots} snapshots in window · {start} → {end} UTC\nRules: span ≥ {days} days, movement ≤ {movement}, large step ≥ {percent}%. Unkeyed historical rows excluded: {unkeyed}.\n* Movement sums comparable intervals only; net is unknown across gaps. ',
+                                  count=len(result.materials), snapshots=result.snapshots_in_window,
+                                  start=result.start, end=result.evaluated_at, days=result.policy.minimum_days,
+                                  movement=result.policy.low_movement, percent=result.policy.large_change_percent,
+                                  unkeyed=result.unkeyed_rows)
+                self._text(self.coverage, i18n.Join((summary, message('Original details / limitations (unchanged):'),
+                                                    ' '.join(result.notes)), '\n'))
                 self._page()
         except queue.Empty:
             pass
@@ -204,14 +223,18 @@ class AnalyticsWindow:
             return
         rows = self.result.materials
         for index in range(self.shown,min(self.shown+PAGE,len(rows))):
-            row=rows[index]
-            last=row.observations[-1]
-            self.tree.insert('', 'end',iid=str(index),values=(row.material_key,row.sheet,Path(row.source_path).name,
-                             last.observed_at,number(last.value),last.state,f'{row.window_span_days:.2f}',number(row.movement),
-                             number(row.net_change),', '.join(row.signals) or 'No heuristic signal'))
+            self.tree.insert('', 'end', iid=str(index), values=self._row_values(rows[index]))
         self.shown=min(self.shown+PAGE,len(rows))
         self.more.configure(state='normal' if self.shown<len(rows) else 'disabled')
-        self.status.set(f'Showing {self.shown}/{len(rows)} groups · Historical / UNVERIFIED · Cloud Not Verified')
+        self._set_status(message('Showing {shown}/{total} groups · Historical / UNVERIFIED · Cloud Not Verified', shown=self.shown, total=len(rows)))
+
+    def _row_values(self, row):
+        last = row.observations[-1]
+        def value(number):
+            return self.locale.text(message('unknown')) if number is None else display(number)
+        return (row.material_key, row.sheet, Path(row.source_path).name, last.observed_at,
+                value(last.value), last.state, f'{row.window_span_days:.2f}', value(row.movement),
+                value(row.net_change), ', '.join(row.signals) or self.locale.text(message('No heuristic signal')))
 
     def _selected(self,_event=None):
         if self.result is None or not self.tree.selection():
@@ -236,6 +259,9 @@ class AnalyticsWindow:
         if self.closed:
             return
         self.closed=True
+        for variable, token in self._option_traces:
+            variable.trace_remove("write", token)  # Tcl traces otherwise retain the destroyed window
+        self._option_traces.clear()
         self.cancel.set()
         self.runner.close()
         try:

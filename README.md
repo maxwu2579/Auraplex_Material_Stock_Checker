@@ -471,3 +471,19 @@ dist\Auraplex_Material_Stock_Checker_v<version>_Portable.zip
 ```
 
 `build\` and `dist\` are not committed. The ZIP is published as a Release asset. See `PACKAGING_REPORT.md` and `RELEASE_CHECKLIST.md`.
+
+### History window interface languages (2026-10-23, source slice)
+
+Inventory History follows the main Chinese / EN / BM selector, including already-open windows, without restarting queries or changing selected data. Titles, controls, headings, loading/failure feedback and coverage framing are translated. Raw source values, status codes and original query/detail notes are preserved; several row-level explanations remain English. Alerts, analytics, daily and maintenance dialogs are not covered by this slice. This source change is uncommitted and awaits independent review; see HISTORY_L10N_IMPLEMENTATION_REPORT.md for focused checks and the Tk finalizer warning observed during testing.
+
+### Stock Alerts interface languages (2026-10-23, source slice)
+
+The open Stock Alerts window now follows the main Chinese / EN / BM selector without reloading or re-evaluating. Controls, headings, rules, session-verification/failure framing and counts are translated; source values, canonical codes and original evaluation/row details remain unchanged. Eight directly relevant tests passed; see ALERTS_L10N_IMPLEMENTATION_REPORT.md. Analytics, Daily Summary and maintenance dialogs remain pending. These localisation changes are uncommitted and await review.
+
+### Analytics and Daily Summary interface languages (2026-10-23)
+
+These windows now follow the main Chinese / EN / BM selector, including open windows, pending work, failures and stale states. Daily preview labels are translated from the same immutable summary; saved HTML/JSON keep the original English report format, as disclosed in the window. Original data, status codes and raw detail/reason text are preserved. Eight new and six directly affected checks passed in about 20 seconds; no full suite. See ANALYSIS_DAILY_L10N_IMPLEMENTATION_REPORT.md. This combined secondary-window localisation work remains uncommitted and awaits independent review. Maintenance/cache/upgrade dialog bodies and some original detail narratives/tooltips remain open.
+
+### Current localisation completion status (2026-10-23; supersedes earlier step statuses)
+
+History, Alerts, Analytics and Daily Summary follow the main Chinese / EN / BM selector; cache, retention and database-upgrade consent/preview framing is now translated too. Source values/canonical codes and original data-bearing narratives/diagnostics remain verbatim. Daily saved HTML/JSON remain English, as stated in the window. Closure/consent and Tk-object lifetime findings were reproduced and repaired; 16 distinct targeted tests have passing results in this final step. This is author source self-review, not independent/packaged acceptance. The combined patch passed independent Claude review and is included in the user-authorised local localisation commit. See SECONDARY_WINDOWS_L10N_CLAUDE_REVIEW.md and SECONDARY_WINDOWS_L10N_REVIEW.md. Four non-blocking P3 observations remain; real API and packaged acceptance are still pending.

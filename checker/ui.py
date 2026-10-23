@@ -20,6 +20,7 @@ from .sync import (CHECKING, CLOUD_NOT_VERIFIED, DATABASE_UNAVAILABLE, LOCAL_VER
 from .report import (BUILDING, CHECKING, VERIFYING, WRITING, Cancellation, ReportError, default_filename,
                      save_verified_report)
 from .service import CheckerService
+from .maintenance_i18n import (message as maintenance_text, cache_description, retention_description, upgrade_description)
 from .history_ui import HistoryWindow
 from .analytics_ui import AnalyticsWindow
 from .alerts_ui import AlertsWindow
@@ -321,6 +322,14 @@ class CheckerApp:
         self._render_preference()
 
     def _language_changed(self, _language):
+        if self.analytics_window is not None and not self.analytics_window.closed:
+            self.analytics_window.language_changed()
+        if self.daily_window is not None and not self.daily_window.closed:
+            self.daily_window.language_changed()
+        if self.alerts_window is not None and not self.alerts_window.closed:
+            self.alerts_window.language_changed()
+        if self.history_window is not None and not self.history_window.closed:
+            self.history_window.language_changed()
         for widget, key, option, values in list(self.i18n_bindings):
             try:
                 widget.configure(**{option: self.t(key, **values)})
@@ -958,29 +967,32 @@ class CheckerApp:
         self._start(lambda: {role: self._read(role, path) for role, path in remembered.items()}, self._loaded,
                     "启动检查", sync=(remembered, "startup"))
 
+    def _maintenance_text(self, template, **values):
+        return self.text(maintenance_text(template, **values))
+
     def preview_cleanup(self):
         """Manual maintenance only. Preview, explicit No-default consent, then a separate guarded worker."""
         if self.busy:
             return
         if self.inventory is None:
-            messagebox.showerror('Local History', self.t("needs_db_body"), parent=self.root)
+            messagebox.showerror(self._maintenance_text('Local History'), self.t("needs_db_body"), parent=self.root)
             return
         if self._alerts_running('Local History'):
             return
         service = retention.RetentionService(self.inventory.db_path)
         def done(result):
             self.maintenance_message = ('st_cleanup_done' if result.backup else 'st_nothing_expired')
-            messagebox.showinfo('Local History', self.t(self.maintenance_message) +
-                                ('\nRecovery backup: ' + result.backup if result.backup else '\nNo data deleted.'),
+            messagebox.showinfo(self._maintenance_text('Local History'), self.t(self.maintenance_message) +
+                                ('\n' + self._maintenance_text('Recovery backup: {path}', path=result.backup) if result.backup else '\n' + self._maintenance_text('No data deleted.')),
                                 parent=self.root)
         def offer(plan):
             self.maintenance_message = 'st_cleanup_preview_only'
             if plan.empty:
-                messagebox.showinfo('Local History', plan.describe() + '\n\nNothing expired. No data deleted.', parent=self.root)
+                messagebox.showinfo(self._maintenance_text('Local History'), retention_description(plan, self.language.language) + '\n\n' + self._maintenance_text('Nothing expired. No data deleted.'), parent=self.root)
                 return
             job = self.job
-            answer = messagebox.askyesno('Confirm local history cleanup?', plan.describe() +
-                                        '\n\nCreate a backup and delete ONLY these expired local records?',
+            answer = messagebox.askyesno(self._maintenance_text('Confirm local history cleanup?'), retention_description(plan, self.language.language) +
+                                        '\n\n' + self._maintenance_text('Create a backup and delete ONLY these expired local records?'),
                                         parent=self.root, default='no')
             if not answer or self.closed or self.busy or job != self.job:
                 return
@@ -999,7 +1011,7 @@ class CheckerApp:
         def closed(window):
             if self.history_window is window:
                 self.history_window = None
-        self.history_window = HistoryWindow(self.root, self.inventory.db_path, on_close=closed)
+        self.history_window = HistoryWindow(self.root, self.inventory.db_path, on_close=closed, language=self.language)
 
     def open_analytics(self):
         if self.inventory is None:
@@ -1012,7 +1024,7 @@ class CheckerApp:
             if self.analytics_window is window:
                 self.analytics_window = None
         self.analytics_window = AnalyticsWindow(self.root, self.inventory.db_path, on_close=closed,
-                                                on_read_error=self.alert_read_failed)
+                                                on_read_error=self.alert_read_failed, language=self.language)
 
     def open_daily(self):
         """M3.2D: open (or bring forward) the Daily Stock Summary window. It only reads the database."""
@@ -1105,7 +1117,7 @@ class CheckerApp:
     def _alerts_running(self, title):
         """Maintenance previews wait for a running alert evaluation (it writes the database)."""
         if self.alert_runner is not None and self.alert_runner.running:
-            messagebox.showinfo(title, "Stock alerts are being evaluated. Please try again in a moment.",
+            messagebox.showinfo(self._maintenance_text(title), self._maintenance_text("Stock alerts are being evaluated. Please try again in a moment."),
                                 parent=self.root)
             return True
         return False
@@ -1227,9 +1239,7 @@ class CheckerApp:
         def done(backup):
             self.maintenance_message = "st_upgraded"
             self._invalidate_alerts("the local database was upgraded")
-            messagebox.showinfo("Database upgrade", "Local database upgraded.\nRecovery backup: " + backup +
-                                "\n\nThe current Excel files will now be read again (thresholds are captured if they "
-                                "were not stored yet); until then alerts are not re-checked.", parent=self.root)
+            messagebox.showinfo(self._maintenance_text('Database upgrade'), self._maintenance_text("Local database upgraded.\nRecovery backup: {backup}\n\nThe current Excel files will now be read again (thresholds are captured if they were not stored yet); until then alerts are not re-checked.", backup=backup), parent=self.root)
             self._load_alert_status()
             if self.stock_path.get() or self.bom_path.get():
                 self.root.after_idle(self.refresh_excel)
@@ -1237,8 +1247,8 @@ class CheckerApp:
         def offer(plan):
             self.maintenance_message = "st_upgrade_preview_only"
             job = self.job
-            answer = messagebox.askyesno("Upgrade local database?", plan.describe() +
-                                         "\n\nCreate a backup and upgrade the local database now?",
+            answer = messagebox.askyesno(self._maintenance_text("Upgrade local database?"), upgrade_description(plan, self.language.language) +
+                                         "\n\n" + self._maintenance_text("Create a backup and upgrade the local database now?"),
                                          parent=self.root, default="no")
             if not answer or self.closed or self.busy or job != self.job:
                 return
@@ -1250,14 +1260,14 @@ class CheckerApp:
         if self.busy:
             return
         if self.inventory is None:
-            messagebox.showerror("Cache unavailable", self.t("needs_db_body"), parent=self.root)
+            messagebox.showerror(self._maintenance_text('Cache unavailable'), self.t("needs_db_body"), parent=self.root)
             return
         database = self.inventory.db_path
         def offer(snapshot):
             job = self.job
-            accepted = messagebox.askyesno("Use historical cached data?", snapshot.describe() +
-                "\n\n仅用于历史试算。不是生产批准。使用上述两个缓存版本？", parent=self.root, default="no")
-            if not accepted or self.busy or job != self.job:
+            accepted = messagebox.askyesno(self._maintenance_text("Use historical cached data?"), cache_description(snapshot, self.language.language) +
+                "\n\n" + self._maintenance_text("Historical trial calculations only. Not production approval. Use these two cached versions?"), parent=self.root, default="no")
+            if not accepted or self.closed or self.busy or job != self.job:
                 return
             self.cache_selection = snapshot
             self.cache_authorized = True
@@ -1601,11 +1611,11 @@ class CheckerApp:
                         self.cache_authorized = False
                         self.mode_label.configure(text=cached.LABEL + ' · Reselect required', foreground='#b00020')
                 self._set_status(i18n.Message("st_maintenance_failed", cloud=CLOUD_NOT_VERIFIED))
-                messagebox.showerror('Local History', str(error), parent=self.root)
+                messagebox.showerror(self._maintenance_text('Local History'), str(error), parent=self.root)
             elif isinstance(error, upgrade.UpgradeError):
                 # Refused or rolled back: the database stays schema 1 and every loaded file stays as it was.
                 self._set_status(i18n.Message("st_upgrade_failed", cloud=CLOUD_NOT_VERIFIED))
-                messagebox.showerror('Database upgrade', str(error), parent=self.root)
+                messagebox.showerror(self._maintenance_text('Database upgrade'), str(error), parent=self.root)
             elif error is not None:
                 if isinstance(error, cached.CacheError) and self.cache_selection is not None:
                     self.cache_authorized = False

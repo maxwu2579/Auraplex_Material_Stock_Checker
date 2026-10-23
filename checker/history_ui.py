@@ -9,13 +9,15 @@ is permanent; this window never shows "Local Sources Verified".
 from __future__ import annotations
 
 from decimal import Decimal, InvalidOperation
+from functools import partial
 from pathlib import Path
 import queue
 import threading
 import tkinter as tk
 from tkinter import ttk
 
-from . import history
+from . import history, i18n
+from .history_i18n import TEXT, message
 from .core import display
 from .inventory_db import parse_stamp
 from .presentation import AMBER, BG, INK, MUTED, work_area
@@ -101,7 +103,10 @@ def signed(text):
 
 
 class HistoryWindow:
-    def __init__(self, master, database, on_close=None):
+    def __init__(self, master, database, on_close=None, *, language=None):
+        self.language = language if language is not None else i18n.LanguageState()
+        self._messages = {}
+        self._status_message = None
         self.database = str(database)
         self.on_close = on_close
         self.events = queue.Queue()
@@ -121,8 +126,90 @@ class HistoryWindow:
         top.configure(background=BG)
         top.protocol("WM_DELETE_WINDOW", self.close)
         self._build()
+        self._register_labels()
+        self._set_label(self.selected_label, "Selected: {material}", material="—")
+        self._set_status(message("Select a Material ID · {banner}", banner=message(history.summary_line())))
+        self.language_changed()
         self.poll_id = top.after(50, self._poll)
-        self._run("sheets", 0, lambda: history.list_sheets(self.database))
+        self._run("sheets", 0, partial(history.list_sheets, self.database))
+
+    def text(self, value):
+        return i18n.render(value, self.language.language)
+
+    def _remember(self, widget, value, option="text"):
+        self._messages[(widget, option)] = value
+        widget.configure(**{option: self.text(value)})
+
+    def _set_label(self, widget, template, **values):
+        self._remember(widget, message(template, **values))
+
+    def _set_status(self, value):
+        self._status_message = value
+        self.status.set(self.text(value))
+
+    def _register_labels(self):
+        # Capture only known UI labels at construction, never source data or result cells.
+        pending = [self.top]
+        while pending:
+            widget = pending.pop()
+            try:
+                value = str(widget.cget("text"))
+                if value in TEXT:
+                    self._messages[(widget, "text")] = message(value)
+            except tk.TclError:
+                pass
+            pending.extend(widget.winfo_children())
+        for days, button in self.range_buttons.items():
+            self._messages[(button, "text")] = message("{days} days", days=days)
+        self._headings = {(name, column): tree.heading(column, "text")
+                          for name, tree in self.trees.items() for column in tree["columns"]}
+
+    def language_changed(self):
+        """Render existing observations only: no reads, generation changes or new worker jobs."""
+        if self.closed:
+            return
+        self.top.title(self.text(message("Inventory History — Historical Observations")))
+        for (widget, option), value in self._messages.items():
+            if widget in (self.coverage, self.details):
+                widget.configure(state="normal")
+                widget.delete("1.0", "end")
+                widget.insert("end", self.text(value))
+                widget.configure(state="disabled")
+            else:
+                widget.configure(**{option: self.text(value)})
+        if self._status_message is not None:
+            self.status.set(self.text(self._status_message))
+        for (name, column), template in self._headings.items():
+            self.trees[name].heading(column, text=self.text(message(template)))
+        index = self.sheet_combo.current()
+        names = tuple(self.sheet_combo["values"])[1:]
+        self.sheet_combo.configure(values=(self.text(message(ALL_SHEETS)), *names))
+        if index == 0:
+            self.sheet_combo.current(0)
+        self._render_candidates()
+        self._tab_titles()
+        for name in self.trees:
+            if self.result is not None:
+                self._count_text(name)
+
+    def _tab_titles(self):
+        for index, name, template in ((0, "records", "Records"), (1, "changes", "Observed Changes")):
+            title = message(template)
+            if self.result is not None:
+                count = self.result.total_rows if name == "records" else self.result.total_changes
+                title = message("{title} ({count})", title=title, count=count)
+            self.tabs.tab(index, text=self.text(title))
+
+    def _render_candidates(self):
+        selected, position = self.candidate_list.curselection(), self.candidate_list.yview()
+        self.candidate_list.delete(0, "end")
+        for c in self.candidates:
+            description = display(c.description) if c.in_current else self.text(message("(not in the current Storage version)"))
+            self.candidate_list.insert("end", f"{c.key}    {description}")
+        for index in selected:
+            self.candidate_list.selection_set(index)
+        if position:
+            self.candidate_list.yview_moveto(position[0])
 
     # ------------------------------------------------------------------ layout
     def _build(self):
@@ -236,7 +323,7 @@ class HistoryWindow:
         self.details = tk.Text(outer, height=2, wrap="word", font=("Segoe UI", 9), relief="flat", background=BG,
                                foreground=MUTED, padx=0, pady=2, state="disabled")
         self.details.grid(row=5, sticky="ew", pady=(6, 0))
-        self._set_details(DETAILS_HINT)
+        self._set_details(message(DETAILS_HINT))
         self.status = tk.StringVar(value="Select a Material ID · " + history.summary_line())
         footer = ttk.Frame(outer)
         footer.grid(row=6, sticky="ew", pady=(4, 0))
@@ -265,13 +352,14 @@ class HistoryWindow:
         self.lanes[kind].submit(generation, action)
 
     def _start(self, kind, generation, action, cancel):
+        events = self.events  # workers own only plain data/queues, never the Tk window or its variables
         def worker():
             try:
                 with history.cancellable(cancel):
                     data, error = action(), None
             except Exception as exc:  # delivered to the Tk thread; never touches widgets here
                 data, error = None, exc
-            self.events.put((kind, generation, cancel, data, error))
+            events.put((kind, generation, cancel, data, error))
         threading.Thread(target=worker, daemon=True, name=f"m4a-history-{kind}").start()
 
     def _poll(self):
@@ -298,6 +386,7 @@ class HistoryWindow:
         self.closed = True  # late worker responses stay in the queue and are never applied
         for lane in self.lanes.values():
             lane.stop()  # no pending request starts after closing; running reads stop at their next check
+            lane.start = None  # break lane -> bound method -> window; Tk variables must die on the UI thread
         for job in (self.poll_id, self._search_job):
             if job is not None:
                 try:
@@ -319,9 +408,9 @@ class HistoryWindow:
     # ------------------------------------------------------------------ sheets
     def _sheets_loaded(self, names, error):
         if error is not None:
-            self.status.set(f"Storage Sheets could not be read: {error} · {history.summary_line()}")
+            self._set_status(message("Storage Sheets could not be read: {error} · {banner}", error=str(error), banner=message(history.summary_line())))
             return
-        self.sheet_combo.configure(values=(ALL_SHEETS, *names))
+        self.sheet_combo.configure(values=(self.text(message(ALL_SHEETS)), *names))
 
     # ------------------------------------------------------------------ search
     def _schedule_search(self, event=None):
@@ -341,28 +430,31 @@ class HistoryWindow:
         self.candidate_list.delete(0, "end")
         if not text.strip():
             self.lanes["search"].stop()  # an earlier search is no longer wanted
-            self.candidate_note.configure(text="Type part of a Material ID, then select one exact ID.", foreground=MUTED)
+            self._set_label(self.candidate_note, "Type part of a Material ID, then select one exact ID.")
+            self.candidate_note.configure(foreground=MUTED)
             return
-        self.candidate_note.configure(text="Searching…", foreground=MUTED)
-        self._run("search", generation, lambda: history.search_materials(self.database, text))
+        self._set_label(self.candidate_note, "Searching…")
+        self.candidate_note.configure(foreground=MUTED)
+        self._run("search", generation, partial(history.search_materials, self.database, text))
 
     def _candidates_loaded(self, data, error):
         self.candidate_list.delete(0, "end")
         self.candidates = []
         if error is not None:
-            self.candidate_note.configure(text=f"Search failed; no candidates shown: {error}", foreground="#b00020")
+            self._set_label(self.candidate_note, "Search failed; no candidates shown: {error}", error=str(error))
+            self.candidate_note.configure(foreground="#b00020")
             return
         found, more = data
         self.candidates = found
-        for c in found:
-            description = display(c.description) if c.in_current else "(not in the current Storage version)"
-            self.candidate_list.insert("end", f"{c.key}    {description}")
+        self._render_candidates()
         if not found:
-            note = "No Material ID in Storage history contains this text. Similar IDs are never merged."
+            note = message("No Material ID in Storage history contains this text. Similar IDs are never merged.")
         else:
-            note = (f"{len(found)} matching IDs" + (f" (first {len(found)} shown; type more)" if more else "") +
-                    ". Select one exact ID; similar IDs stay separate.")
-        self.candidate_note.configure(text=note, foreground=MUTED)
+            limit = message(" (first {count} shown; type more)", count=len(found)) if more else ""
+            note = message("{count} matching IDs{limit}. Select one exact ID; similar IDs stay separate.",
+                           count=len(found), limit=limit)
+        self._remember(self.candidate_note, note)
+        self.candidate_note.configure(foreground=MUTED)
 
     def _picked(self, _event=None):
         selection = self.candidate_list.curselection()
@@ -373,7 +465,7 @@ class HistoryWindow:
     def select(self, key):
         """Choose one exact Material ID (as listed) and query it."""
         self.selected_key = key
-        self.selected_label.configure(text=f"Selected: {key}")
+        self._set_label(self.selected_label, "Selected: {material}", material=key)
         self.query()
 
     # ------------------------------------------------------------------ query
@@ -382,17 +474,17 @@ class HistoryWindow:
             return
         if self.selected_key is None:
             if not auto:
-                self.status.set("Select a Material ID from the list first · " + history.summary_line())
+                self._set_status(message("Select a Material ID from the list first · {banner}", banner=message(history.summary_line())))
             return
         self.query_gen += 1
         generation = self.query_gen
         key, days = self.selected_key, self.days.get()
-        sheet = None if self.sheet.get() == ALL_SHEETS else self.sheet.get()
-        self._clear("Querying…")  # the previous result is gone before the new one is requested
-        self.status.set(f"Querying {key} · {days} days · {history.summary_line()}")
-        self._run("query", generation, lambda: history.material_history(self.database, key, days, sheet))
+        sheet = None if self.sheet_combo.current() == 0 else self.sheet.get()
+        self._clear(message("Querying…"))  # the previous result is gone before the new one is requested
+        self._set_status(message("Querying {material} · {days} days · {banner}", material=key, days=days, banner=message(history.summary_line())))
+        self._run("query", generation, partial(history.material_history, self.database, key, days, sheet))
 
-    def _clear(self, message):
+    def _clear(self, content):
         self.result = None
         for name, tree in self.trees.items():
             children = tree.get_children()
@@ -400,51 +492,53 @@ class HistoryWindow:
                 tree.delete(*children)
             self.shown[name] = 0
             self.more_buttons[name].grid_remove()
-            self.count_labels[name].configure(text="")
-        self.tabs.tab(0, text="Records")
-        self.tabs.tab(1, text="Observed Changes")
-        self._set_coverage(message, error=False)
-        self._set_details(DETAILS_HINT)
+            self._remember(self.count_labels[name], "")
+        self._tab_titles()
+        self._set_coverage(content, error=False)
+        self._set_details(message(DETAILS_HINT))
 
     def _set_details(self, text):
+        self._messages[(self.details, "body")] = text
         self.details.configure(state="normal")
         self.details.delete("1.0", "end")
-        self.details.insert("end", text)
+        self.details.insert("end", self.text(text))
         self.details.configure(state="disabled")
 
     def _set_coverage(self, text, error):
+        self._messages[(self.coverage, "body")] = text
         self.coverage.configure(state="normal")
         self.coverage.delete("1.0", "end")
-        self.coverage.insert("end", text)
+        self.coverage.insert("end", self.text(text))
         self.coverage.configure(state="disabled", foreground="#b00020" if error else INK)
 
     def _result_loaded(self, result, error):
         if error is not None:
             self._clear("")
-            self._set_coverage(f"QUERY FAILED — no history is shown. Earlier results were cleared.\n{error}", error=True)
-            self.status.set("Query failed · no results shown · " + history.summary_line())
+            self._set_coverage(message("QUERY FAILED — no history is shown. Earlier results were cleared.\n{error}", error=str(error)), error=True)
+            self._set_status(message("Query failed · no results shown · {banner}", banner=message(history.summary_line())))
             return
         self.result = result
         c = result.coverage
-        scope = result.sheet if result.sheet is not None else "all Sheets, each shown separately"
-        lines = [f"{history.HISTORICAL} for {result.material_key} · {scope} · last {c.days} days "
-                 f"({local(c.window_start)} → {local(c.evaluated_at)} local time). "
-                 f"{c.snapshots_in_window} Storage snapshot(s) in the window. "
-                 + ("Full window covered by history." if c.covers_full_window else "Window NOT fully covered by history.")]
-        lines.extend(c.notes)
+        scope = result.sheet if result.sheet is not None else message("all Sheets, each shown separately")
+        covered = message("Full window covered by history." if c.covers_full_window else "Window NOT fully covered by history.")
+        lines = [message("{banner} for {material} · {scope} · last {days} days ({start} → {end} local time). {count} Storage snapshot(s) in the window. {covered}",
+                         banner=history.HISTORICAL, material=result.material_key, scope=scope, days=c.days,
+                         start=local(c.window_start), end=local(c.evaluated_at), count=c.snapshots_in_window, covered=covered)]
+        if c.notes:
+            lines.extend((message("Original query notes (unchanged):"), *c.notes))
         if not result.total_rows and not result.total_changes:
-            lines.append("No history for this Material ID in this range. Nothing is assumed; missing is not 0.")
+            lines.append(message("No history for this Material ID in this range. Nothing is assumed; missing is not 0."))
         if result.truncated:
-            lines.append(f"Only the first {len(result.rows)} of {result.total_rows} records and {len(result.changes)} "
-                         f"of {result.total_changes} changes were loaded. Choose a Sheet or a shorter range.")
-        lines.append(history.OBSERVED_CHANGE_CAVEAT)
-        self._set_coverage("\n".join(lines), error=False)
-        self.tabs.tab(0, text=f"Records ({result.total_rows})")
-        self.tabs.tab(1, text=f"Observed Changes ({result.total_changes})")
+            lines.append(message("Only the first {rows} of {total_rows} records and {changes} of {total_changes} changes were loaded. Choose a Sheet or a shorter range.",
+                                 rows=len(result.rows), total_rows=result.total_rows, changes=len(result.changes), total_changes=result.total_changes))
+        # Keep the original query-layer explanation as evidence; add a translated, persistent safety explanation.
+        lines.extend((message("Observed Change ≠ Actual Consumption"), history.OBSERVED_CHANGE_CAVEAT))
+        self._set_coverage(i18n.Join(lines, "\n"), error=False)
+        self._tab_titles()
         self._render_page("records")
         self._render_page("changes")
-        self.status.set(f"{history.HISTORICAL} loaded {local(c.evaluated_at, '%H:%M:%S')} · {history.NOT_CURRENT} · "
-                        "Cloud Not Verified")
+        self._set_status(message("HISTORICAL OBSERVATIONS loaded {time} · Not current stock · Cloud Not Verified",
+                                 time=local(c.evaluated_at, '%H:%M:%S')))
 
     def _render_page(self, name):
         if self.result is None:
@@ -455,15 +549,18 @@ class HistoryWindow:
             values, tags = (self._record_values if name == "records" else self._change_values)(items[index])
             tree.insert("", "end", iid=str(index), values=values, tags=tags)
         self.shown[name] = min(start + PAGE, len(items))
-        total = self.result.total_rows if name == "records" else self.result.total_changes
-        text = f"Showing {self.shown[name]} of {len(items)} loaded"
-        if total > len(items):
-            text += f" ({total} in total; the rest were not loaded — narrow the query)"
-        self.count_labels[name].configure(text=text)
+        self._count_text(name)
         if self.shown[name] < len(items):
             self.more_buttons[name].grid()
         else:
             self.more_buttons[name].grid_remove()
+
+    def _count_text(self, name):
+        items = self.result.rows if name == "records" else self.result.changes
+        total = self.result.total_rows if name == "records" else self.result.total_changes
+        limit = message(" ({total} in total; the rest were not loaded — narrow the query)", total=total) if total > len(items) else ""
+        self._remember(self.count_labels[name], message("Showing {shown} of {loaded} loaded{limit}",
+                                                       shown=self.shown[name], loaded=len(items), limit=limit))
 
     @staticmethod
     def _record_values(r):

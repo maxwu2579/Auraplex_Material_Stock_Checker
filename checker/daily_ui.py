@@ -17,7 +17,9 @@ import queue
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-from . import daily
+from . import daily, daily_preview, i18n
+from .analysis_daily_i18n import TEXT, message
+from .window_language import WindowLanguage
 from .presentation import BG, INK, MUTED, work_area
 
 BANNER = ("DAILY STOCK SUMMARY · From synchronised Excel data · Cloud Not Verified · "
@@ -32,6 +34,8 @@ class DailySummaryWindow:
     def __init__(self, master, owner, today=None):
         """owner: the CheckerApp (database path, alert gate, daily_session()). today: test hook for the local date."""
         self.owner = owner
+        self.locale = WindowLanguage(owner.language, TEXT, message)
+        self.preview_source = None
         self.database = str(owner.inventory.db_path)
         self.gate = owner.alert_gate
         self.today = today or date.today
@@ -53,7 +57,29 @@ class DailySummaryWindow:
         top.configure(background=BG)
         top.protocol("WM_DELETE_WINDOW", self.close)
         self._build()
+        self.locale.register(self.top)
+        self._set_status("Cloud Not Verified")
+        self.locale.label(self.hint, i18n.Join((message(HINT), message("Preview labels follow the interface language; saved HTML/JSON retain the original English report format.")), "\n"))
+        self.language_changed()
         self.poll_id = top.after(50, self._poll)
+
+    def tr(self, template, **values):
+        return self.locale.text(message(template, **values))
+
+    def _set_status(self, value):
+        self.locale.status(self.status, value)
+
+    def _set_state(self, value, colour):
+        self.locale.label(self.state, value)
+        self.state.configure(foreground=colour)
+
+    def language_changed(self):
+        if self.closed:
+            return
+        self.top.title(self.tr('Daily Stock Summary'))
+        self.locale.render()
+        if self.preview_source is not None:
+            self._set_preview(self.preview_source)
 
     # ------------------------------------------------------------------ layout
     def _build(self):
@@ -107,7 +133,7 @@ class DailySummaryWindow:
         self.status = tk.StringVar(value="Cloud Not Verified")
         ttk.Label(footer, textvariable=self.status, font=("Segoe UI", 9), foreground=MUTED).pack(side="left",
                                                                                                 fill="x")
-        self.date_text.trace_add("write", lambda *_: self._refresh_state())
+        self._date_trace = self.date_text.trace_add("write", lambda *_: self._refresh_state())
 
     # ------------------------------------------------------------------ date
     def selected_date(self):
@@ -130,24 +156,23 @@ class DailySummaryWindow:
         if self.closed:
             return
         if self.saving is not None:
-            self.status.set("Saving… wait until the files are written · Cloud Not Verified")
+            self._set_status(message("Saving… wait until the files are written · Cloud Not Verified"))
             return
         day = self.selected_date()
         if day is None:
-            self.status.set("Enter the date as YYYY-MM-DD · Cloud Not Verified")
+            self._set_status(message("Enter the date as YYYY-MM-DD · Cloud Not Verified"))
             return
         if day > self.today():
-            self.status.set(f"{day} is in the future; choose today or an earlier date · Cloud Not Verified")
+            self._set_status(message("{day} is in the future; choose today or an earlier date · Cloud Not Verified", day=day))
             return
         session = self.owner.daily_session()
         reasons = []
         if day != self.today():
-            reasons.append(f"{day} is a past date: its stock and alert state cannot be reconstructed")
+            reasons.append(message("{day} is a past date: its stock and alert state cannot be reconstructed", day=day))
         if session.authorization is None:
-            reasons.append(session.reason or "the Excel files were not both verified in this session")
+            reasons.append(session.reason or message("the Excel files were not both verified in this session"))
         elif not session.alert_current:
-            reasons.append("the stock alerts were not re-checked in this session" +
-                           (f" ({session.reason})" if session.reason else ""))
+            reasons.append(message("the stock alerts were not re-checked in this session{reason}", reason=f" ({session.reason})" if session.reason else ""))
         allow = False
         if reasons:
             if not self._confirm_unverified(day, reasons):
@@ -158,10 +183,9 @@ class DailySummaryWindow:
 
     def _confirm_unverified(self, day, reasons) -> bool:
         answer = messagebox.askyesno(
-            "Generate UNVERIFIED summary?",
-            f"The summary for {day} cannot be verified:\n\n- " + "\n- ".join(reasons) +
-            "\n\nIt would be marked UNVERIFIED in the preview, the file names and the report. Historical observations "
-            "stay historical; nothing is presented as current stock.\n\nGenerate an UNVERIFIED summary?",
+            self.tr("Generate UNVERIFIED summary?"),
+            self.tr("The summary for {day} cannot be verified:\n\n- {reasons}\n\nIt would be marked UNVERIFIED in the preview, the file names and the report. Historical observations stay historical; nothing is presented as current stock.\n\nGenerate an UNVERIFIED summary?",
+                    day=day, reasons=i18n.Join(reasons, "\n- ")),
             parent=self.top, default="no")
         return bool(answer) and not self.closed
 
@@ -170,11 +194,11 @@ class DailySummaryWindow:
         self.latest_generate = self.request_id
         self.requested = (self.request_id, day, allow)
         if self.summary is not None:
-            self.stale = "a newer summary is being generated"
+            self.stale = message("a newer summary is being generated")
         database, gate = self.database, self.gate
         self.runner.request(self.request_id, "generate",
                             lambda: daily.generate(database, day, session, gate=gate, allow_unverified=allow))
-        self.status.set(f"Generating the summary for {day}… · Cloud Not Verified")
+        self._set_status(message("Generating the summary for {day}… · Cloud Not Verified", day=day))
         self._refresh_state()
 
     # ------------------------------------------------------------------ save
@@ -184,30 +208,23 @@ class DailySummaryWindow:
         from .scheduling import task_xml
         if self.closed or self.runner.busy:
             return
-        output = filedialog.askdirectory(parent=self.top, title="Choose the scheduled daily-report folder",
+        output = filedialog.askdirectory(parent=self.top, title=self.tr("Choose the scheduled daily-report folder"),
                                          mustexist=True)
         if not output or self.closed:
             return
-        at = simpledialog.askstring('Daily schedule draft', 'Local daily time (HH:MM, e.g. 18:00):',
+        at = simpledialog.askstring(self.tr('Daily schedule draft'), self.tr('Local daily time (HH:MM, e.g. 18:00):'),
                                    initialvalue='18:00', parent=self.top)
         if at is None or self.closed:
             return
         try:
             payload = task_xml(Path(self.database).parent, output, at)
         except (ValueError, OSError) as exc:
-            messagebox.showerror('Schedule draft', str(exc), parent=self.top)
+            messagebox.showerror(self.tr('Schedule draft'), str(exc), parent=self.top)
             return
-        if not messagebox.askyesno('Save schedule draft only?',
-            f'Daily at {at} (local time), output:\n{output}\n\n'
-            'This exports XML only; no Windows task will be registered or enabled.\n'
-            'The current user must be logged in, with both source files available.\n'
-            'Each run tries at most 3 times, 30 seconds apart; no Windows restart loop.\n'
-            'No password is stored. Missed schedules request one delayed run of the current day; '
-            'historical daily stock states are not reconstructed. On battery power the task waits.\n'
-            'Requires the explicitly upgraded database and previously selected Storage/BOM paths.\n\n'
-            'Save the draft for review?', parent=self.top, default='no') or self.closed:
+        if not messagebox.askyesno(self.tr('Save schedule draft only?'),
+            self.tr('Daily at {at} (local time), output:\n{output}\n\nThis exports XML only; no Windows task will be registered or enabled.\nThe current user must be logged in, with both source files available.\nEach run tries at most 3 times, 30 seconds apart; no Windows restart loop.\nNo password is stored. Missed schedules request one delayed run of the current day; historical daily stock states are not reconstructed. On battery power the task waits.\nRequires the explicitly upgraded database and previously selected Storage/BOM paths.\n\nSave the draft for review?', at=at, output=output), parent=self.top, default='no') or self.closed:
             return
-        path = filedialog.asksaveasfilename(parent=self.top, title='Save new Task Scheduler XML (draft only)',
+        path = filedialog.asksaveasfilename(parent=self.top, title=self.tr('Save new Task Scheduler XML (draft only)'),
                                           initialfile='Auraplex_Daily_Summary.xml', defaultextension='.xml',
                                           filetypes=[('Task Scheduler XML', '*.xml')], confirmoverwrite=False)
         if not path or self.closed:
@@ -216,11 +233,11 @@ class DailySummaryWindow:
             with open(path, 'xb') as stream:
                 stream.write(payload)
         except OSError as exc:
-            messagebox.showerror('Schedule draft not saved', str(exc), parent=self.top)
+            messagebox.showerror(self.tr('Schedule draft not saved'), str(exc), parent=self.top)
             return
-        messagebox.showinfo('Draft saved — no task installed', str(path) +
-                            '\nReview/import with Windows Task Scheduler only when ready. '
-                            'No task has been created or enabled.', parent=self.top)
+        messagebox.showinfo(self.tr('Draft saved — no task installed'),
+                            self.tr('{path}\nReview/import with Windows Task Scheduler only when ready. No task has been created or enabled.', path=path), parent=self.top)
+
 
     def can_save(self) -> bool:
         return (self.summary is not None and self.stale is None and self.saving is None and not self.runner.busy
@@ -230,20 +247,19 @@ class DailySummaryWindow:
         if self.closed or not self.can_save():
             return
         summary = self.summary
-        folder = filedialog.askdirectory(parent=self.top, title="Save the Daily Stock Summary (HTML + JSON) in…",
+        folder = filedialog.askdirectory(parent=self.top, title=self.tr("Save the Daily Stock Summary (HTML + JSON) in…"),
                                          initialdir=self.last_folder or str(_documents()), mustexist=True)
         if not folder or self.closed:
             return
         if self.summary is not summary or not self.can_save():
-            messagebox.showerror("Summary changed", "The summary changed or became out of date while the folder was "
-                                 "chosen. Generate it again.", parent=self.top)
+            messagebox.showerror(self.tr("Summary changed"), self.tr("The summary changed or became out of date while the folder was chosen. Generate it again."), parent=self.top)
             return
         self.last_folder = folder
         self.request_id += 1
         self.saving = self.request_id
         database, gate = self.database, self.gate
         self.runner.request(self.request_id, "save", lambda: daily.save(summary, folder, database, gate=gate))
-        self.status.set("Saving… · Cloud Not Verified")
+        self._set_status(message("Saving… · Cloud Not Verified"))
         self._refresh_state()
 
     def open_saved(self):
@@ -251,7 +267,7 @@ class DailySummaryWindow:
             try:
                 os.startfile(str(self.saved.html))  # the default browser; the file has no external resources
             except OSError as exc:
-                messagebox.showerror("Open report", str(exc), parent=self.top)
+                messagebox.showerror(self.tr('Open report'), str(exc), parent=self.top)
 
     # ------------------------------------------------------------------ results (Tk thread only)
     def _poll(self):
@@ -279,21 +295,18 @@ class DailySummaryWindow:
             self.summary, self.stale = None, None
             self._set_preview("")
             if isinstance(error, daily.ConfirmationRequired):
-                self.state.configure(text="Not generated: this summary would be UNVERIFIED and needs confirmation.",
-                                     foreground=RED)
+                self._set_state(message("Not generated: this summary would be UNVERIFIED and needs confirmation."), RED)
                 self.top.after_idle(lambda: self._confirm_after(request_id, day, error.reasons))
             else:
                 if isinstance(error, daily.DailyReadError):
                     self.owner.alert_read_failed(error)  # as every alert/status read: verification is discarded
-                self.state.configure(text=f"GENERATION FAILED for {day} — no summary is shown: {error}",
-                                     foreground=RED)
-                self.status.set("Generation failed · Cloud Not Verified")
+                self._set_state(message("GENERATION FAILED for {day} — no summary is shown: {error}", day=day, error=str(error)), RED)
+                self._set_status(message("Generation failed · Cloud Not Verified"))
             self._refresh_buttons()
             return
         self.summary, self.stale, self.saved = summary, None, None
-        self._set_preview(daily.render_text(summary))
-        self.status.set(f"Summary {summary.report_id[:8]} for {summary.report_date} generated · "
-                        f"{summary.status} · Cloud Not Verified")
+        self._set_preview(summary)
+        self._set_status(message("Summary {id} for {day} generated · {status} · Cloud Not Verified", id=summary.report_id[:8], day=summary.report_date, status=summary.status))
         self._refresh_state()
 
     def _confirm_after(self, request_id, day, reasons):
@@ -302,7 +315,7 @@ class DailySummaryWindow:
         if self._confirm_unverified(day, reasons) and request_id == self.latest_generate:
             self._request(day, self.owner.daily_session(), True)
         else:
-            self.status.set("Not generated · Cloud Not Verified")
+            self._set_status(message("Not generated · Cloud Not Verified"))
 
     def _saved(self, request_id, saved, error):
         if request_id != self.saving:
@@ -313,13 +326,13 @@ class DailySummaryWindow:
                 self.stale = str(error)
             if isinstance(error, daily.DailyReadError):
                 self.owner.alert_read_failed(error)
-            self.status.set("Not saved · Cloud Not Verified")
+            self._set_status(message("Not saved · Cloud Not Verified"))
             self._refresh_state()
             detail = "\n\n".join(x for x in (str(error), getattr(error, "cleanup_warning", "")) if x)
-            messagebox.showerror("Daily Stock Summary not saved", detail, parent=self.top)
+            messagebox.showerror(self.tr('Daily Stock Summary not saved'), detail, parent=self.top)
             return
         self.saved = saved
-        self.status.set(f"Saved report folder {saved.folder} ({saved.html.name}, {saved.json.name}) · Cloud Not Verified")
+        self._set_status(message("Saved report folder {folder} ({html}, {json}) · Cloud Not Verified", folder=saved.folder, html=saved.html.name, json=saved.json.name))
         self._refresh_state()
 
     def _check_stale(self):
@@ -328,16 +341,14 @@ class DailySummaryWindow:
         if s is None or self.stale is not None or not s.verified:
             return
         if not self.gate.valid(s.generation) or not self.owner.alert_current:
-            self.stale = ("this program's verification changed after generation (selection, sync, failure or "
-                          "database read failure)")
+            self.stale = message("this program's verification changed after generation (selection, sync, failure or database read failure)")
             self._refresh_state()
 
     # ------------------------------------------------------------------ rendering
-    def _set_preview(self, text):
-        self.preview.configure(state="normal")
-        self.preview.delete("1.0", "end")
-        self.preview.insert("end", text)
-        self.preview.configure(state="disabled")
+    def _set_preview(self, value):
+        self.preview_source = value if isinstance(value, daily.DailySummary) else None
+        text = daily_preview.render(value, self.owner.language.language) if self.preview_source is not None else value
+        self.locale.body(self.preview, text)
 
     def _refresh_state(self):
         if self.closed:
@@ -345,18 +356,16 @@ class DailySummaryWindow:
         s = self.summary
         if s is not None:
             if self.stale is not None:
-                text, colour = f"OUT OF DATE — {s.status} summary for {s.report_date}: {self.stale}. Generate again.", RED
+                text, colour = message("OUT OF DATE — {status} summary for {day}: {reason}. Generate again.", status=s.status, day=s.report_date, reason=self.stale), RED
             elif self.selected_date() is None or self.selected_date().isoformat() != s.report_date:
-                text, colour = f"Preview is for {s.report_date}, not the selected date. Generate again to save.", RED
+                text, colour = message("Preview is for {day}, not the selected date. Generate again to save.", day=s.report_date), RED
             elif s.verified:
-                text, colour = (f"VERIFIED summary for {s.report_date} — this program checked both Excel files and "
-                                "re-checked the alerts in this session · Cloud Not Verified"), GREEN
+                text, colour = message("VERIFIED summary for {day} — this program checked both Excel files and re-checked the alerts in this session · Cloud Not Verified", day=s.report_date), GREEN
             else:
-                text, colour = (f"UNVERIFIED summary for {s.report_date} (generated after your confirmation) · "
-                                "Cloud Not Verified"), RED
-            self.state.configure(text=text, foreground=colour)
+                text, colour = message("UNVERIFIED summary for {day} (generated after your confirmation) · Cloud Not Verified", day=s.report_date), RED
+            self._set_state(text, colour)
         elif self.runner.busy:
-            self.state.configure(text="Generating…", foreground=MUTED)
+            self._set_state(message("Generating…"), MUTED)
         self._refresh_buttons()
 
     def _refresh_buttons(self):
@@ -374,6 +383,7 @@ class DailySummaryWindow:
         if self.closed:
             return
         self.closed = True
+        self.date_text.trace_remove("write", self._date_trace)  # release only this window's own Tcl callback
         self.runner.close()  # a running task finishes (a save publishes completely or not at all); nothing delivered
         try:
             self.top.after_cancel(self.poll_id)
