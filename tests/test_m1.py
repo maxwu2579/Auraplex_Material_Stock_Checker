@@ -329,6 +329,7 @@ class UiTests(TempFiles):
         target = self.base / 'out.xlsx'
         with patch('checker.ui.filedialog.asksaveasfilename', return_value=str(target)):
             self.app.export_button.invoke()
+        self.finish()  # R2: the export runs in the background
         book = load_workbook(target)
         self.assertEqual(book.sheetnames, ['Shortage', 'Exceptions'])
         from checker.report import HEADER_ROW

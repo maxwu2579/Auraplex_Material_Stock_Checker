@@ -352,7 +352,8 @@ class UiFlowTests(Files):
         def dialog(**options):
             asked.update(options); return str(self.base / options['initialfile'])
         with patch('checker.ui.filedialog.asksaveasfilename', side_effect=dialog):
-            self.app.export_button.invoke(); self.app.export_button.invoke()
+            # R2: exports run in the background, one at a time; the second click comes after the first finished
+            self.app.export_button.invoke(); self.finish(); self.app.export_button.invoke(); self.finish()
         self.assertRegex(asked['initialfile'], r'^Material_Check_DEMO-200-A-40W_QTY10_\d{8}_\d{6}\.xlsx$'); self.assertFalse(asked['confirmoverwrite'])
         reports = sorted(p.name for p in self.base.glob('Material_Check_*.xlsx'))
         self.assertEqual(len(reports), 2); self.assertFalse(self.errors)  # second export got its own name

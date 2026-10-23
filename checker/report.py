@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from contextlib import contextmanager, nullcontext
 from copy import copy
 import hashlib
 import json
@@ -10,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import tempfile
+import threading
 
 from openpyxl import Workbook
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
@@ -24,6 +26,54 @@ from .sync import content_signature
 
 class ReportError(ValueError):
     """The chosen report destination is not acceptable; nothing was written."""
+
+
+class ExportCancelled(Exception):
+    """The export was cancelled before publication: no report was published. Its own staging file is removed; if that
+    removal fails, `cleanup_warning` says which file remains and why."""
+
+
+class Cancellation:
+    """Cancellation of one export, serialised with its publication.
+
+    Cancelling and publishing take the same lock, so exactly one of them happens first. If cancel() wins, the export
+    is never published. If the publication wins, the report stays published and cancel() reports that. The lock is
+    held only for the cancellation check and the publishing rename/link, never while a report is generated, written
+    or verified, so the caller of cancel() (the Tk thread) waits at most for one filesystem rename."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._cancelled = False
+        self.published = None    # the published report path, once publication has won
+
+    def is_set(self):
+        return self._cancelled
+
+    def cancel(self):
+        """Returns True when the cancellation came first (nothing was or will be published)."""
+        with self._lock:
+            self._cancelled = True
+            return self.published is None
+
+    @contextmanager
+    def publishing(self, target):
+        with self._lock:
+            if self._cancelled:
+                raise ExportCancelled("Export cancelled before the report was published.")
+            yield
+            self.published = target
+
+
+# Stages an export reports through its optional `progress` callback (no percentage is invented for any of them).
+CHECKING, BUILDING, WRITING, VERIFYING = "checking", "building", "writing", "verifying"
+
+
+def _step(stage, progress, cancelled):
+    """Cancellation boundary before each stage; a stage already running (e.g. the workbook save) is never killed."""
+    if cancelled is not None and cancelled.is_set():
+        raise ExportCancelled("Export cancelled before the report was published.")
+    if progress is not None and stage is not None:
+        progress(stage)
 
 
 ALL_HEADER = ("No.", "Material ID", "Description", "BOM QTY", "Production Quantity", "Required", "Stock", "Shortage",
@@ -169,14 +219,17 @@ def _export_provenance(book, checked, verified):
             sheet.cell(row, 3).comment = Comment(json.dumps(metadata, ensure_ascii=False, indent=2), "Material Stock Checker")
 
 
-def save_verified_report(path, result, stock_book, bom_book, source_binding, source_paths):
+def save_verified_report(path, result, stock_book, bom_book, source_binding, source_paths, *, progress=None,
+                         cancelled=None):
     """Application export boundary: stage privately, recheck, then publish a new file without overwriting.
 
     No retries or SQLite reads; failures leave no final report. The low-level save_report remains available for
     formatting raw calculation data, whereas the application's exports must use this version-bound boundary.
+    progress(stage) and cancelled (an Event) are optional; see _stage_report for the cancellation boundaries.
     """
     paths = dict(source_paths)
     checked = source_binding
+    _step(CHECKING, progress, cancelled)
     verified = binding.verify_export(checked, paths)
     for role, source in (("stock", stock_book), ("bom", bom_book)):
         if source.fingerprint != checked.versions[role]:
@@ -194,31 +247,47 @@ def save_verified_report(path, result, stock_book, bom_book, source_binding, sou
         except BaseException:
             book.close()
             raise
-    return _stage_report(path, sources, build, lambda: binding.verify_export(checked, paths))
+    return _stage_report(path, sources, build, lambda: binding.verify_export(checked, paths), progress=progress,
+                         cancelled=cancelled)
 
 
-def _stage_report(path, sources, build, validate):
-    """Shared no-overwrite publication; caller supplies its own explicit verification contract."""
+def _stage_report(path, sources, build, validate, *, progress=None, cancelled=None):
+    """Shared no-overwrite publication; caller supplies its own explicit verification contract.
+
+    Cancellation is checked before building, before writing and before the final verification; these steps and the
+    verification itself run to completion. With a Cancellation, the last check and the publication are serialised
+    with cancel(): a cancellation that comes first prevents publication, one that comes later never removes the
+    published report. A cancelled export removes only its own staging file (a removal failure is reported through
+    `cleanup_warning` on the exception, never hidden)."""
+    _step(None, None, cancelled)
     target = safe_target(path, sources)
     descriptor, temporary = tempfile.mkstemp(prefix=".mrc-export-", suffix=".xlsx", dir=target.parent)
     os.close(descriptor)
     failure = None
     try:
+        _step(BUILDING, progress, cancelled)
         book = build()
         try:
+            _step(WRITING, progress, cancelled)
             book.save(temporary)
         finally:
             book.close()
+        _step(VERIFYING, progress, cancelled)
         # This last observation is after report generation. The report conservatively records the earlier
         # completed export verification, not a future timestamp that was not known when the workbook was saved.
         for _ in range(10):
             target = safe_target(path, sources)
             validate()
+            # The publication boundary: the cancellation check and the rename/link are one step under the
+            # Cancellation lock (a plain event only gets the check). Cancelled first: nothing is published.
+            guard = cancelled.publishing(target) if hasattr(cancelled, "publishing") else nullcontext()
+            _step(None, None, cancelled)
             try:
-                if os.name == "nt":
-                    os.rename(temporary, target)  # Windows refuses an existing destination atomically
-                else:
-                    os.link(temporary, target)    # same no-overwrite contract on POSIX
+                with guard:
+                    if os.name == "nt":
+                        os.rename(temporary, target)  # Windows refuses an existing destination atomically
+                    else:
+                        os.link(temporary, target)    # same no-overwrite contract on POSIX
                 return target
             except FileExistsError:
                 continue

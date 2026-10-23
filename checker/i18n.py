@@ -352,6 +352,26 @@ M = {
     "st_exported": ("Report exported successfully.", "报告已成功导出。", "Laporan berjaya dieksport."),
     "st_cache_exported": ("{label} report exported · Cloud Not Verified", "{label} 报告已导出 · Cloud Not Verified",
                           "Laporan {label} dieksport · Cloud Not Verified"),
+    # background export stages (no percentage: none of the stages has measurable progress)
+    "st_export_checking": ("Exporting · checking the sources…", "正在导出 · 核对来源…",
+                           "Mengeksport · menyemak sumber…"),
+    "st_export_building": ("Exporting · generating the report…", "正在导出 · 生成报告…",
+                           "Mengeksport · menjana laporan…"),
+    "st_export_writing": ("Exporting · writing the file…", "正在导出 · 写入文件…", "Mengeksport · menulis fail…"),
+    "st_export_verifying": ("Exporting · final source check before publishing…", "正在导出 · 发布前最终核对来源…",
+                            "Mengeksport · semakan akhir sumber sebelum diterbitkan…"),
+    "st_export_cancelled": ("Export cancelled: the result, inputs or authorisation changed, or the window closed. "
+                            "No report was published.",
+                            "导出已取消：结果、输入或授权已变化，或窗口已关闭。未发布任何报告。",
+                            "Eksport dibatalkan: keputusan, input atau kebenaran berubah, atau tetingkap ditutup. "
+                            "Tiada laporan diterbitkan."),
+    "st_export_leftover": ("Temporary export file not removed: {detail}", "导出临时文件未能删除：{detail}",
+                           "Fail eksport sementara tidak dibuang: {detail}"),
+    "st_export_late": ("A report for the earlier result had already been published before the change: {path}. "
+                       "It is not an export of the current result.",
+                       "变化发生前，之前结果的报告已经发布：{path}。它不是当前结果的导出。",
+                       "Laporan untuk keputusan terdahulu telah diterbitkan sebelum perubahan: {path}. "
+                       "Ia bukan eksport keputusan semasa."),
     "st_remember_failed": ("Could not remember the selected file for next start: {error}",
                            "无法记住所选文件供下次启动使用：{error}",
                            "Fail dipilih tidak dapat diingat untuk permulaan seterusnya: {error}"),
@@ -453,6 +473,14 @@ M = {
     "err_export": ("{detail}\nNothing was exported. CHECK again, then export again.",
                    "{detail}\n未导出任何内容。请重新 CHECK 后再导出。",
                    "{detail}\nTiada apa dieksport. CHECK semula, kemudian eksport semula."),
+    "err_export_leftover": ("{detail}\nThe export was cancelled or belonged to an earlier result; the current result "
+                            "was not changed. The temporary file named above may still contain report data: remove it "
+                            "yourself if it is still there.",
+                            "{detail}\n导出已取消或属于之前的结果；当前结果未改变。上面列出的临时文件可能仍含报告数据，"
+                            "如仍存在请自行删除。",
+                            "{detail}\nEksport telah dibatalkan atau milik keputusan terdahulu; keputusan semasa tidak "
+                            "berubah. Fail sementara di atas mungkin masih mengandungi data laporan: buang sendiri jika "
+                            "masih ada."),
     "title_open_folder": ("Open Folder failed", "无法打开文件夹", "Gagal membuka folder"),
     "pref_failed": ("The interface language could not be saved for the next start ({error}). It applies to this "
                     "session only.",

@@ -10,6 +10,15 @@ from checker.inventory_db import DatabaseError
 from checker.sync import LOCAL_VERIFIED, InventorySync
 
 VERSION = "1.1.0.dev0"
+SELF_TEST_TIMEOUT_MS = 180_000   # Tk timer (not a hard deadline): an unfinished self-test is then failed and closed
+# --self-test exit codes: 0 passed, 1 ran but did not pass (or did not finish), 2 OUTPUT_DIR or self_test.json unusable
+SELF_TEST_FAILED, SELF_TEST_UNWRITABLE = 1, 2
+
+
+def say(text):
+    """A windowed executable has no console: stderr may be None."""
+    if sys.stderr is not None:
+        print(text, file=sys.stderr)
 
 
 def open_local_data(data_dir):
@@ -26,9 +35,13 @@ def self_test(root, app, storage, bom, output_dir):
     """Packaging check: drive one load / search / check / export / Refresh Excel with the given (synthetic) workbooks,
     then exit.
 
-    Writes self_test.json to output_dir because a windowed executable has no console. Not used in normal operation."""
+    Writes self_test.json to output_dir because a windowed executable has no console. Not used in normal operation.
+    Returns {"code": ...}, filled in when the check finishes: the window is closed even if self_test.json cannot be
+    written. SELF_TEST_TIMEOUT_MS is a Tk timer, not a hard process deadline: it cannot fire while a Tk callback is
+    blocked, and a non-daemon export worker in an uninterruptible step keeps the process alive until that step ends."""
     from checker import ui
     output = Path(output_dir)
+    outcome, exporting = {"code": None}, []
     errors, report = [], {"version": VERSION, "frozen": bool(getattr(sys, "frozen", False)), "executable": sys.executable,
                           "ui_module": ui.__file__, "passed": False}
     ui.messagebox.showerror = lambda title, text, **kw: errors.append(f"{title}: {text}")  # a modal box would block the check
@@ -50,9 +63,24 @@ def self_test(root, app, storage, bom, output_dir):
             connection.close()
 
     def finish():
+        if outcome["code"] is not None:
+            return
         report["errors"] = errors
-        (output / "self_test.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-        app.close()
+        try:
+            (output / "self_test.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            outcome["code"] = 0 if report["passed"] else SELF_TEST_FAILED
+        except (OSError, TypeError, ValueError) as exc:
+            outcome["code"] = SELF_TEST_UNWRITABLE
+            say(f"Self-test result could not be written to {output / 'self_test.json'}: {type(exc).__name__}: {exc}")
+        finally:
+            try:
+                app.close()
+            except Exception:  # the window must go away whatever happened
+                root.destroy()
+
+    def timeout():
+        errors.append(f"Self-test did not finish within {SELF_TEST_TIMEOUT_MS // 1000} s")
+        finish()
 
     def step():
         try:
@@ -76,14 +104,18 @@ def self_test(root, app, storage, bom, output_dir):
                 app.product_text.set(ids[0])
                 app.quantity_text.set("10")
                 app.check()
-            elif "export" not in report:
+            elif "export_started" not in report:
                 result = app.result
                 report["window"] = [root.winfo_width(), root.winfo_height()]
                 report["counts"] = {c: result.category_count(c) for c in ("SHORTAGE", "EXCEPTION", "ENOUGH")} if result else None
                 report["rows"] = [[*app.tree.item(i, "values"), app.tree.item(i, "tags")[0]] for i in app.tree.get_children()]
                 report["result_verified"] = app.result_current  # bound to the confirmed Storage/BOM versions
-                written = app.write_export(str(output / "self_test_report.xlsx")) if result else None
-                report["export"] = str(written) if written else None
+                # The background export holds app.busy; the next steps wait for it above.
+                exporting.append(app.start_export(str(output / "self_test_report.xlsx")) if result else None)
+                report["export_started"] = exporting[0] is not None
+            elif "export" not in report:
+                task = exporting[0]
+                report["export"] = str(task.written) if task is not None and task.accepted else None
                 report["database_before_refresh"] = database()
                 app.refresh_excel()                        # unchanged files: no new version, no new snapshot
             else:
@@ -105,6 +137,8 @@ def self_test(root, app, storage, bom, output_dir):
             finish()
 
     root.after(200, step)
+    root.after(SELF_TEST_TIMEOUT_MS, timeout)
+    return outcome
 
 
 def main():
@@ -134,6 +168,16 @@ def main():
         if sys.stdout is not None:
             print(json.dumps(outcome.__dict__, ensure_ascii=True))  # machine-readable on Windows console code pages
         return outcome.code
+    if args.self_test:
+        # Created on demand inside the given folder only; never another folder, never the real application data.
+        output = Path(args.self_test[2])
+        try:
+            output.mkdir(parents=True, exist_ok=True)
+            if not output.is_dir():
+                raise NotADirectoryError(f"not a folder: {output}")
+        except (OSError, ValueError) as exc:
+            say(f"Self-test OUTPUT_DIR is unusable: {output}: {type(exc).__name__}: {exc}")
+            return SELF_TEST_UNWRITABLE
     import tkinter as tk
     from checker.ui import CheckerApp
     root = tk.Tk()
@@ -147,12 +191,13 @@ def main():
     app = CheckerApp(root, inventory=inventory, settings=settings, inventory_error=error, preferences=preferences)
     if args.smoke_test:
         root.after(150, app.close)
-    if args.self_test:
-        self_test(root, app, *args.self_test)
+    outcome = self_test(root, app, *args.self_test) if args.self_test else None
     root.mainloop()
     if args.smoke_test and sys.stdout is not None:
         print("M0 launcher / Tkinter initialization: PASS" + (f" · inventory database: {'OK' if inventory else error}"
                                                               if data_dir else ""))
+    if outcome is not None:  # a window closed before the check finished counts as a failure
+        return SELF_TEST_FAILED if outcome["code"] is None else outcome["code"]
 
 
 if __name__ == "__main__":

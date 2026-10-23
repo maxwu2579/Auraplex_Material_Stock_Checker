@@ -131,13 +131,16 @@ def verify(snapshot):
         raise CacheError('Cached Storage/BOM versions changed. Select cached data again and CHECK.')
 
 
-def save(path, result, stock, bom, bound):
-    """Separate historical export contract. Cannot substitute for the verified Excel writer."""
+def save(path, result, stock, bom, bound, *, progress=None, cancelled=None):
+    """Separate historical export contract. Cannot substitute for the verified Excel writer.
+
+    progress / cancelled: the optional stage callback and cancellation boundaries of report._stage_report."""
     if not isinstance(bound, CacheBinding) or not bound.valid:
         raise CacheError('No valid explicit cached CHECK. Please select cached data and CHECK.')
     snapshot = bound.snapshot
     if stock != snapshot.stock or bom != snapshot.bom or result.product not in bom.products:
         raise CacheError('Report data does not belong to the selected cached versions.')
+    report._step(report.CHECKING, progress, cancelled)
     verify(snapshot)
     target = Path(path)
     if not target.name.startswith('UNVERIFIED_'):
@@ -168,4 +171,5 @@ def save(path, result, stock, bom, bound):
                     ensure_ascii=False, indent=2), 'Material Stock Checker')
         return book
 
-    return report._stage_report(target, (stock.path, bom.path), build, lambda: verify(snapshot))
+    return report._stage_report(target, (stock.path, bom.path), build, lambda: verify(snapshot), progress=progress,
+                                cancelled=cancelled)

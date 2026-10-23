@@ -57,6 +57,7 @@ class ExportFreshnessTests(UiBase):
             return str(self.target)
         with patch('checker.ui.filedialog.asksaveasfilename', side_effect=choose):
             self.app.export()
+        self.finish()  # R2: the export runs in the background; its final source check refuses it
         self.assert_refused()
 
     def test_changed_result_during_dialog_is_not_exported_under_old_name(self):

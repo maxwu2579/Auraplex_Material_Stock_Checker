@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 import os
 import queue
@@ -17,7 +17,8 @@ from . import alerts, binding, cached, daily, i18n, retention, upgrade
 from .queries import overall_state, overall_times, with_known_failures
 from .sync import (CHECKING, CLOUD_NOT_VERIFIED, DATABASE_UNAVAILABLE, LOCAL_VERIFIED, NOT_SYNCED, SOURCE_CHANGED,
                    SOURCE_UNAVAILABLE, STATUS_UNKNOWN, SYNC_FAILED, USING_PREVIOUS)
-from .report import ReportError, default_filename, save_verified_report
+from .report import (BUILDING, CHECKING, VERIFYING, WRITING, Cancellation, ReportError, default_filename,
+                     save_verified_report)
 from .service import CheckerService
 from .history_ui import HistoryWindow
 from .analytics_ui import AnalyticsWindow
@@ -80,6 +81,26 @@ def local_time(moment, pattern="%Y-%m-%d %H:%M:%S"):
     return moment.astimezone().strftime(pattern) if moment else "—"
 
 
+EXPORT_STAGES = {CHECKING: "st_export_checking", BUILDING: "st_export_building", WRITING: "st_export_writing",
+                 VERIFYING: "st_export_verifying"}
+
+
+@dataclass(eq=False)
+class ExportTask:
+    """Everything one background export needs, captured on the Tk thread when it starts. The worker never reads the
+    changing interface state; the Tk thread cancels the task when that state moves on."""
+    path: str
+    result: object
+    stock_book: object
+    bom_book: object
+    binding: object          # binding.SourceBinding, or cached.CacheBinding in cache mode
+    sources: dict            # the Storage/BOM paths selected when the export started
+    job: int
+    cancel: Cancellation = field(default_factory=Cancellation)  # serialised with the publication
+    written: Path | None = None
+    accepted: bool = False   # published and shown as the export of the current result
+
+
 class CheckerApp:
     def __init__(self, root: tk.Tk, inventory=None, settings=None, inventory_error=None, preferences=None):
         """inventory: an InventorySync (local SQLite mirror); settings: remembered file paths. Both optional:
@@ -117,6 +138,8 @@ class CheckerApp:
         self.alert_text = "Stock Alerts"
         self.deferred_alerts = None  # an evaluation requested while a job was running
         self.cache_selection = None  # explicit opt-in for this session only; never restored from settings
+        self.export_task = None      # the one running background export (ExportTask), if any
+        self.export_events = queue.Queue()
         self.cache_authorized = False
         self.maintenance_message = ''
         self.busy = False
@@ -1426,6 +1449,7 @@ class CheckerApp:
         self.details.configure(state="disabled")
 
     def invalidate(self):
+        self._cancel_export()
         self.result = None
         self.result_binding = None
         self.export_feedback.grid_remove()
@@ -1438,6 +1462,23 @@ class CheckerApp:
         for value in self.summary_counts.values():
             value.set("—")
         self._show_result_state()
+
+    @property
+    def cache_authorized(self):
+        return self._cache_authorized
+
+    @cache_authorized.setter
+    def cache_authorized(self, value):
+        if value != getattr(self, "_cache_authorized", value):
+            self._cancel_export()  # an export never outlives the cache authorisation it started with
+        self._cache_authorized = value
+
+    def _cancel_export(self):
+        """The interface moved on (inputs, result, authorisation or the window): the running export may not publish.
+        A report already published stays; otherwise the worker stops at its next cancellation boundary."""
+        task = getattr(self, "export_task", None)
+        if task is not None:
+            task.cancel.cancel()  # waits at most for a publication already under way (one rename)
 
     @property
     def result_current(self) -> bool:
@@ -1526,6 +1567,7 @@ class CheckerApp:
     def _poll(self):
         if self.closed:
             return
+        self._drain_export()
         self._drain_alert_events()
         self.home.drain()
         while True:  # progress of a running sync (worker thread → queue → here, the Tk thread)
@@ -1893,7 +1935,7 @@ class CheckerApp:
             if self.result is not result or self.result_binding is not bound or self.job != job:
                 messagebox.showerror(self.t("title_changed"), self.t("err_result_changed"), parent=self.root)
                 return
-            self.write_export(path)
+            self.start_export(path)
 
     def _refuse_outdated_export(self, detail=""):
         if isinstance(self.result_binding, cached.CacheBinding):
@@ -1956,9 +1998,16 @@ class CheckerApp:
                                       cloud=CLOUD_NOT_VERIFIED))
         self._refuse_outdated_export(detail)
 
-    def write_export(self, path):
-        """Save the current result as a new .xlsx. Returns the path written, or None if refused or failed."""
-        if self.busy or self.result is None or self.stock_book is None or self.bom_book is None:
+    def start_export(self, path):
+        """Save the current result as a new .xlsx on a worker thread. Returns the ExportTask, or None if refused.
+
+        One export at a time: it holds `busy`, so CHECK, Refresh, loading and a second export are refused meanwhile.
+        Result, workbooks, binding and source paths are captured here; the worker reports its stages and the outcome
+        through a queue, and only the Tk thread touches widgets. Input, result or cache-authorisation changes and
+        closing the window cancel the task: it publishes nothing after that, and a report published just before is
+        kept but never shown as the export of the current result. The final source check stays immediately before
+        publication, inside the worker, exactly as in the synchronous writer."""
+        if self.busy or self.closed or self.result is None or self.stock_book is None or self.bom_book is None:
             return None
         if not self.result_exportable:
             if isinstance(self.result_binding, cached.CacheBinding):
@@ -1966,35 +2015,94 @@ class CheckerApp:
             else:
                 self._refuse_outdated_export()
             return None
+        task = ExportTask(str(path), self.result, self.stock_book, self.bom_book, self.result_binding,
+                          self._export_sources(), self.job)
+        self.export_task = task
+        self._set_busy(True)
+        self._set_status(i18n.Message(EXPORT_STAGES[CHECKING]))
+        # Not a daemon: closing the program lets a cancelled export reach its boundary and remove its staging file.
+        threading.Thread(target=self._export_worker, args=(task,), name="m0-export").start()
+        return task
+
+    def _export_worker(self, task):
+        progress = lambda stage: self.export_events.put((task, "stage", stage))
         try:
-            if isinstance(self.result_binding, cached.CacheBinding):
-                written = cached.save(path, self.result, self.stock_book, self.bom_book, self.result_binding)
+            if isinstance(task.binding, cached.CacheBinding):
+                written = cached.save(task.path, task.result, task.stock_book, task.bom_book, task.binding,
+                                      progress=progress, cancelled=task.cancel)
             else:
-                written = save_verified_report(path, self.result, self.stock_book, self.bom_book,
-                                               self.result_binding, self._export_sources())
-        except cached.CacheError as exc:
-            self._cache_export_failed(exc)
-            return None
-        except binding.ExportVerificationError as exc:
-            self._export_verification_failed(exc)
-            return None
-        except (ReportError, OSError) as exc:
-            detail = "\n".join(part for part in (str(exc), getattr(exc, "cleanup_warning", "")) if part)
-            message = (i18n.Message("err_write", path=path, detail=detail) if isinstance(exc, OSError) else
+                written = save_verified_report(task.path, task.result, task.stock_book, task.bom_book, task.binding,
+                                               task.sources, progress=progress, cancelled=task.cancel)
+            outcome = (written, None)
+        except Exception as exc:  # delivered to the Tk thread; never touches widgets here
+            outcome = (None, exc)
+        self.export_events.put((task, "done", outcome))
+
+    def _drain_export(self):
+        while True:
+            try:
+                task, kind, value = self.export_events.get_nowait()
+            except queue.Empty:
+                return
+            if task is not self.export_task:
+                continue
+            if kind == "done":
+                self._export_finished(task, *value)
+            elif not task.cancel.is_set() and i18n.Message(EXPORT_STAGES[value]) != self.status_message:
+                self._set_status(i18n.Message(EXPORT_STAGES[value]))
+
+    def _export_finished(self, task, written, error):
+        self.export_task = None
+        task.written = written
+        self._set_busy(False)
+        if (task.cancel.is_set() or self.result is not task.result or self.result_binding is not task.binding
+                or self.job != task.job):
+            # The interface moved on while the export ran. Nothing is applied to the current result: a published
+            # report belonged to the earlier result, a cancelled one was never published.
+            outcome = (i18n.Message("st_export_late", path=str(written)) if written is not None
+                       else i18n.Message("st_export_cancelled"))
+            leftover = getattr(error, "cleanup_warning", "")
+            if not leftover:
+                self._set_status(outcome)
+                return
+            # This task's own staging file could not be removed: say where and why, with the original error.
+            self._set_status(i18n.Join((outcome, i18n.Message("st_export_leftover",
+                                                              detail=leftover.replace("\n", " · "))), " · "))
+            detail = "\n".join(part for part in (str(error), leftover) if part)
+            messagebox.showerror(self.t("title_export_failed"), self.text(i18n.Message("err_export_leftover",
+                                                                                      detail=detail)), parent=self.root)
+            return
+        if isinstance(error, cached.CacheError):
+            self._cache_export_failed(error)
+        elif isinstance(error, binding.ExportVerificationError):
+            self._export_verification_failed(error)
+        elif error is not None:
+            detail = "\n".join(part for part in (str(error), getattr(error, "cleanup_warning", "")) if part)
+            message = (i18n.Message("err_write", path=task.path, detail=detail) if isinstance(error, OSError) else
                        i18n.Message("err_export", detail=detail))
             messagebox.showerror(self.t("title_export_failed"), self.text(message), parent=self.root)
-            return None
-        self.export_path.set(str(written))
-        self.hide_details()
-        self.export_feedback.grid()
-        self._resize()
-        self._set_status(i18n.Message("st_cache_exported", label=cached.LABEL)
-                         if isinstance(self.result_binding, cached.CacheBinding) else i18n.Message("st_exported"))
-        return written
+        else:
+            task.accepted = True
+            self.export_path.set(str(written))
+            self.hide_details()
+            self.export_feedback.grid()
+            self._resize()
+            self._set_status(i18n.Message("st_cache_exported", label=cached.LABEL)
+                             if isinstance(task.binding, cached.CacheBinding) else i18n.Message("st_exported"))
+
+    def write_export(self, path):
+        """Export and wait (automation and tests): the same background task as the Export button, while Tk keeps
+        processing events. Returns the path written for the current result, or None if refused, failed or cancelled."""
+        task = self.start_export(path)
+        while task is not None and self.export_task is task and not self.closed:
+            self.root.update()
+            time.sleep(0.005)
+        return task.written if task is not None and task.accepted else None
 
     def close(self):
         self.closed = True
         self.cancelled.set()
+        self._cancel_export()  # publishes nothing more; a report already published is kept
         if self.assistant is not None:
             self.assistant.close()
         if self.history_window is not None:
