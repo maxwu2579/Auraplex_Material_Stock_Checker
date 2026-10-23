@@ -1,8 +1,10 @@
 """M4E host controller. One worker, memory-only permissions, queued immutable observations; no Tk."""
+from contextlib import contextmanager
 from dataclasses import dataclass
 import json
 from pathlib import Path
 import queue
+import re
 import threading
 import uuid
 
@@ -11,6 +13,7 @@ from .agent_tools import InventoryTools, specifications, encoded
 from .assistant_language import error_text, tr
 from .credentials import WindowsKeyStore
 from .history import read_view
+from . import narrative
 from .providers import create_provider
 
 
@@ -50,6 +53,7 @@ class AssistantSession:
         self.events = queue.Queue()
         self.authorized = self.outbound = False
         self._authorized_basis = None
+        self._report_approval = None
         self.context, self._selections = {}, {}
 
     @property
@@ -71,6 +75,7 @@ class AssistantSession:
     def _revoke(self):
         self.authorized = self.outbound = False
         self._authorized_basis = None
+        self._report_approval = None
         self.context, self._selections = {}, {}
         if self.tools is not None:
             self.tools.revoke()
@@ -88,7 +93,45 @@ class AssistantSession:
                 return False
             self.provider.authorize_outbound(policy=self.provider.policy, accepted=accepted)
             self.outbound = accepted
+            self._report_approval = None
             return True
+
+    def approve_report(self, expected_epoch, basis, facts_digest, report_language, request_sha256, accepted):
+        """Mint a one-use report grant only after the UI displayed the exact request and received Yes."""
+        with self._lock:
+            if (not accepted or self.closed or self._busy or self._epoch != expected_epoch or
+                    not self.authorized or not self.outbound or basis != self._authorized_basis or
+                    type(facts_digest) is not str or not re.fullmatch(r'[0-9a-f]{64}', facts_digest) or
+                    report_language not in narrative.LANGUAGES or type(request_sha256) is not str or
+                    not re.fullmatch(r'[0-9a-f]{64}', request_sha256)):
+                self._report_approval = None
+                self.provider.clear_narrative_authorization()
+                return None
+            if not self.provider.authorize_narrative(policy=narrative.REPORT_POLICY, accepted=True):
+                self._report_approval = None
+                return None
+            token = uuid.uuid4().hex
+            self._report_approval = (token, expected_epoch, basis, facts_digest, report_language, request_sha256)
+            return token
+
+    def discard_report_approval(self, token=None):
+        with self._lock:
+            if self._report_approval is not None and (token is None or self._report_approval[0] == token):
+                self._report_approval = None
+                self.provider.clear_narrative_authorization()
+
+    @contextmanager
+    def report_guard(self, expected_epoch, basis):
+        """M4F delivery: held while a saved report is published. Yields whether this session still holds exactly the
+        local-data authorisation the report was built under; invalidate()/close() wait until the block ends. Never
+        waits for SQLite while held (callers take their database read lock first)."""
+        with self._lock:
+            yield (not self.closed and self._epoch == expected_epoch and self.authorized and
+                   basis is not None and basis == self._authorized_basis)
+
+    def data_basis(self, conn):
+        """The data basis inside the caller's read transaction (the same digest report previews are bound to)."""
+        return self.tools._basis(conn)
 
     def preview_request(self, question):
         return self.provider.preview([{'role': 'system', 'content': SYSTEM},
@@ -104,6 +147,14 @@ class AssistantSession:
         with self._lock:
             if self.closed or self._busy or (expected_epoch is not None and expected_epoch != self._epoch):
                 return False
+            if action == 'report_narrative':
+                approval = self._report_approval
+                if (approval is None or approval[0] != payload.get('approval') or approval[1] != self._epoch or
+                        approval[2] != payload.get('basis') or approval[3] != payload.get('facts_digest') or
+                        approval[4] != payload.get('report_language') or approval[5] != payload.get('request_sha256') or
+                        not self.authorized or not self.outbound):
+                    return False
+                self._report_approval = None
             self._busy = True
             epoch, cancel = self._epoch, threading.Event()
             self._cancel = cancel
@@ -113,12 +164,14 @@ class AssistantSession:
             try:
                 result = self._execute(action, payload, cancel)
                 basis = result.get('basis')
-                if basis and action in ('chat', 'local') and basis != self._authorized_basis:
+                if basis and action in ('chat', 'local', 'report_preview', 'report_narrative') and basis != self._authorized_basis:
                     result = failure('STALE_DATA')
                 if basis and (self.tools is None or self.tools.basis() != basis):
                     result = failure('STALE_DATA')
             except (ProviderFailure, SessionFailure) as exc:
                 result = failure(exc.code)
+            except ValueError:
+                result = failure('INVALID_ARGUMENTS' if action in ('report_preview', 'report_narrative') else 'DATABASE_READ_FAILED')
             except Exception:
                 result = failure('KEY_FAILED' if action in ('save_key', 'delete_key') else 'DATABASE_READ_FAILED')
             finally:
@@ -215,6 +268,38 @@ class AssistantSession:
                     'observation': observation, 'context': context}
         if not self.authorized:
             return failure('CONSENT_REQUIRED')
+        if action == 'report_preview':
+            if payload.get('period') not in narrative.PERIODS:
+                return failure('INVALID_ARGUMENTS')
+            with read_view(self.tools.database) as conn:
+                basis = self.tools._basis(conn)
+                if basis != self._authorized_basis:
+                    raise SessionFailure('STALE_DATA')
+                try:
+                    facts = narrative.build_in(conn, payload['period'])
+                except ValueError:
+                    raise SessionFailure('INVALID_ARGUMENTS') from None
+            return {'status': 'REPORT_PREVIEW', 'basis': basis, 'facts': facts,
+                    'facts_digest': narrative.digest(facts), 'evidence': []}
+        if action == 'report_narrative':
+            if not self.outbound:
+                return failure('OUTBOUND_CONSENT_REQUIRED')
+            try:
+                facts = narrative.validate_facts(payload.get('facts'))
+            except ValueError:
+                raise SessionFailure('INVALID_ARGUMENTS') from None
+            facts_digest = narrative.digest(facts)
+            if facts_digest != payload.get('facts_digest') or payload.get('basis') != self._authorized_basis:
+                raise SessionFailure('STALE_DATA')
+            if self.tools.basis() != self._authorized_basis:
+                raise SessionFailure('STALE_DATA')
+            reply = self.provider.complete_narrative(
+                facts, payload.get('report_language', 'en'), expected_request_sha256=payload.get('request_sha256'),
+                timeout=20, cancel=cancel)
+            if reply.calls or type(reply.text) is not str or not reply.text.strip() or len(reply.text) > 4000:
+                raise ProviderFailure('INVALID_PROVIDER_RESPONSE')
+            return {'status': 'NARRATIVE', 'basis': self._authorized_basis, 'facts': facts,
+                    'facts_digest': facts_digest, 'narrative': reply.text, 'evidence': []}
         if action == 'chat':
             if not self.outbound:
                 return failure('OUTBOUND_CONSENT_REQUIRED')
@@ -271,6 +356,11 @@ def render(result, language):
         return error_text(result.get('error', 'REQUEST_FAILED'), language)
     if result.get('status') == 'AUTHORIZED':
         return tr('authorized', language)
+    if result.get('status') == 'REPORT_PREVIEW':
+        return tr('report_preview_ready', language)
+    if result.get('status') == 'NARRATIVE':
+        return (tr('report_interpretation', language) + '\n' + result['narrative'] + '\n' +
+                tr('report_review_caveat', language))
     if result.get('status') in ('KEY_SAVED', 'KEY_DELETED'):
         return tr('saved_key' if result['status'] == 'KEY_SAVED' else 'deleted_key', language)
     lines = [tr('history', language)]

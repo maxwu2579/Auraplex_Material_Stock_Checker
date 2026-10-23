@@ -33,8 +33,8 @@ M3 uses deterministic Python logic, without a model API. MIN QTY fields, units a
 | M4B | Low observed movement, long unchanged periods, possible excess inventory, unusual fluctuations and stock risk | Source reviewed and committed locally (`547039d`). Sheet-metadata integrity follow-up implemented and reviewed with M4C; EXE, real Drive, other-PC and physical-DPI acceptance pending |
 | M4C | Agent loop, tool calling, controlled read-only query tools, structured results and errors | Source reviewed and committed locally (`434357d`). Both P2 budget/history-scan fixes committed as `5b2e75f`; 73 M4C/M4B regressions passed. Nine allowlisted tools, explicit historical consent, UNVERIFIED evidence. No chat UI |
 | M4D | Default DeepSeek provider with replaceable provider interface; future OpenAI, Gemini and local AI server adapters | Source reviewed and committed locally (`d25ad29`). 80 focused checks passed at review. Minimal outbound projection, session consent, Windows vault, bounded HTTPS and deterministic quota notices. No live API or packaged acceptance |
-| M4E | Bottom-right robot launcher, inventory assistant/chat, three-language response routing, evidence and freshness presentation | Source implemented; separate review/acceptance and local commit pending. Robot launcher, responsive chat window/side panel, offline tools, separate data/API permissions, deterministic language/evidence/quota presentation. Source checks only; no live API, real Drive or packaged acceptance. See M4E reports |
-| M4F | AI daily/weekly narratives, trend explanations, purchasing-review suggestions and email notifications | Planned |
+| M4E | Bottom-right robot launcher, inventory assistant/chat, three-language response routing, evidence and freshness presentation | Implemented and committed locally (`85f8a65`); not released. No live API, real Drive or packaged acceptance. See M4E reports |
+| M4F | AI daily/weekly narratives, trend explanations, purchasing-review suggestions and email notifications | Slice 1 (aggregate narrative) and slice 2 (saved HTML + JSON reports, local .eml drafts) reviewed and included in the local M4F delivery commit. P1-DL1 remediation passed focused Codex re-review. Remaining: purchase-review suggestions, real e-mail sending/notifications. No real API, mail client, packaged build or real data validation; not released. |
 | M4G | Optional company PDF/manual/purchasing-policy RAG using embeddings and vector search | Optional; not release-blocking |
 
 SQL queries and deterministic analytics must work without an AI API. DeepSeek unavailability, quota or errors must not break stock checking, statistics or ordinary report generation. AI cannot invent numbers or replace deterministic calculations. Rules and inventory tools remain independent of the provider.
@@ -100,6 +100,20 @@ Language acceptance examples:
 
 Also test turn-by-turn language switching, BOM/PCS/KG exclusions, ambiguous Malay/English words, errors/refusals/cancellation in the selected language and equivalent numeric results across all three languages.
 
+### M4F — first read-only narrative slice
+
+- Daily and weekly aggregate previews are built locally from one read-only SQLite view. Weekly comparison uses observed event-count deltas only; incomplete or pruned history stays unknown.
+- A separate per-report, default-No consent shows the exact serialized DeepSeek request. The payload allowlists aggregate windows and category counts, sync outcomes/times, coverage and data-quality counts; it excludes Material IDs, descriptions, individual quantities, Sheet names, local paths, file hashes and database rows. A due balance check may still occur under the existing M4D API consent and is disclosed.
+- The report and AI answer remain UNVERIFIED / Cloud Not Verified. Stored alerts are labeled not re-checked; alert categories may overlap; a conservative trilingual keyword check discards model replies that state counts or plainly claim sufficient/production-ready stock, cloud verification, actual consumption or a purchase action (not a guarantee of correctness); exact counts remain in the local, trilingual preview.
+- No purchasing advice, order action or Email delivery is included in this first slice. These remain later M4F work and require separate business/security review. No real provider/API, company data, packaged EXE or live Drive acceptance is claimed.
+
+### M4F — second slice: local report delivery and e-mail drafts
+
+- **Completed (source):** save the AI-reports daily/weekly preview as HTML + JSON (same report ID) without any AI call; optionally include an AI interpretation accepted for exactly those facts, as a separate UNVERIFIED section; write a local `.eml` draft (zh/en/ms) that attaches exactly that saved report. Saving re-checks the data basis under a held rollback-journal read lock and the assistant session under its lock right before one no-overwrite folder rename (the M3.2D publication contract).
+- **Verified this round:** synthetic data, temporary databases, fake transport; new delivery tests plus the directly affected M4F/M4E regressions (see `M4F_DELIVERY_TEST_REPORT.md`).
+- **Not executed:** real data, real API, real mail clients, network/cloud target folders, packaged EXE, other PCs, physical DPI.
+- **Remaining M4F work:** purchase-review suggestions, real sending/automatic notifications (with their own credential and authorisation design). The six UI concepts are under review; no new design was ported.
+
 ## Phase 4 — Product Quality & Delivery
 
 | Workstream | Scope | Status |
@@ -123,4 +137,4 @@ Also test turn-by-turn language switching, BOM/PCS/KG exclusions, ambiguous Mala
 
 Finish M4A → M3.2C → M3.2D → deployment-appropriate M3.2E → M4B → M4C/M4D → M4E → M4F → final delivery checks. M4E visual design may be prepared earlier without implying AI functionality is complete. M4G is optional.
 
-Codex is taking primary implementation on 2026-10-22 at the user's request while Claude Code capacity is limited. Preserve a distinct review/acceptance gate before committing new milestones. During development run affected checks, including data-safety checks when those paths change; consolidate regression and acceptance at milestone completion. Avoid repeated full-suite runs without new changes or failures. Report unexecuted environments honestly. Development completion, local commit, push and release are separate decisions; never automatically proceed to the next milestone or publication.
+As of 2026-10-23, Claude Code handles implementation and Codex handles independent review and user-authorised local commits. The earlier temporary Codex implementation role has ended. Preserve a distinct review/acceptance gate before committing new milestones. During development run affected checks, including data-safety checks when those paths change; consolidate regression and acceptance at milestone completion. Avoid repeated full-suite runs without new changes or failures. Report unexecuted environments honestly. Development completion, local commit, push and release are separate decisions; never automatically proceed to the next milestone or publication.

@@ -17,11 +17,13 @@ The application is not digitally signed, so Windows may show a "Windows protecte
 ## Features
 
 Development source includes the reviewed M4C controlled read-only tools and Agent core, the M4D DeepSeek
-adapter (local commit `d25ad29`), and an M4E robot/chat interface awaiting separate review (not in v1.0.0).
+adapter (local commit `d25ad29`), and the M4E robot/chat interface (local commit `85f8a65`), plus the
+the reviewed M4F aggregate narratives, local HTML/JSON report delivery and .eml drafts. These development features are not in
+the published v1.0.0 portable package.
 No real API was called in implementation/verification. Data access requires session-only historical-cache authorization and returns
 UNVERIFIED / Cloud Not Verified evidence. External transmission requires a separate, explicit session consent.
 M4C's two P2 follow-ups are fixed in local commit `5b2e75f`; see `M4C_P2_REMEDIATION.md`.
-See the M4D and M4E implementation/test reports for scope, safety boundaries and untested environments.
+See the M4D, M4E and M4F implementation/test reports for scope, safety boundaries and untested environments.
 
 - Product ID search (type part of an ID, pick from the list)
 - Production quantity calculation
@@ -285,7 +287,7 @@ valid counts; it never represents Tokens remaining. Chinese/English/Malay notice
 in `checker.quota.notice_text`. M4E shows these notices and the balance-check state in chat.
 Quota data is not sent back to the model or stored in SQLite.
 
-## Inventory assistant (M4E, development source awaiting review)
+## Inventory assistant (M4E, development source)
 
 Click the blue robot at the bottom right to open/collapse the assistant. Small windows use a separate
 chat window; sufficiently wide windows use a side panel while keeping the checker usable. Chat,
@@ -338,8 +340,74 @@ Only one assistant worker runs at a time; all Tk updates/dialogs run on the UI t
 with truncation marked. Tools retain M4C's bounded result/query limits; host Sheet metadata is capped at
 200 Storage Sheets and 200 product Sheets. Conversation, candidate permissions and consent are not saved.
 Draft text survives collapse, but unsaved key input is cleared. Reopening/restarting requires new permissions.
-No new dependency, database migration, M4F feature or release artifact is introduced. See
+No new dependency, database migration or release artifact is introduced. See
 `M4E_IMPLEMENTATION_REPORT.md` and `M4E_TEST_REPORT.md` for verification details and delivery limits.
+
+## AI history narratives (M4F first slice, development source)
+
+Quality issue counts are separated by Storage/BOM; an unsynchronised source shows unknown, not zero.
+Weekly comparison requires a retained snapshot or successful Storage check in each period, as well as history coverage.
+Per-period sync attempt/success counts are shown. A failed check alone is not an observation; successful UNCHANGED
+checks permit zero recorded changes. Observation frequency may differ, so these comparisons do not measure consumption.
+
+The **AI reports** tab builds daily and weekly previews locally from retained SQLite history. Weekly comparison
+uses observed change-event counts; missing or pruned history stays unknown. Alert counts are stored observations,
+not re-checked in this view, and categories may overlap. Observed change does not prove consumption.
+
+The exact outbound DeepSeek request is shown before each report send, with a separate one-report confirmation
+that defaults to No. The request contains aggregate date windows and category counts, recorded sync outcomes and
+times, history coverage, and data-quality counts. It excludes Material IDs, descriptions, individual stock/BOM
+quantities, Sheet names, local paths, file hashes and database rows. A separate balance recheck may occur under
+the existing API consent if due. Local and AI results remain **UNVERIFIED / Cloud Not Verified**. A small
+keyword check (Chinese, English, Malay) discards AI replies that state counts (digits, or number words attached to
+counted items) or plainly claim that stock is sufficient/production-ready, cloud-verified, actually consumed, or
+that a purchase should be made; negated sentences ("not actual consumption") pass. A discarded reply is reported
+and the local counts stay. The check is keyword-based and cannot guarantee that every reply is correct. The
+preview is shown in the assistant's current language (canonical codes stay visible) and is re-rendered from the
+same facts after a language switch; the AI is asked to reply in that language. This slice has no purchasing advice or email
+delivery, and it is not part of the published v1.0.0 EXE. It used only synthetic SQLite/workbooks and a fake API;
+no real API, company data, packaged EXE or live Drive was tested. See `M4F_IMPLEMENTATION_REPORT.md` and
+`M4F_TEST_REPORT.md`.
+
+## Report files and e-mail drafts (M4F second slice, development source)
+
+**Done.** On the assistant's **AI reports** tab, below the preview:
+- **Save report (HTML + JSON)…** saves the shown daily/weekly preview into a folder you choose, as one new report
+  folder `UNVERIFIED_AI_Report_<DAILY|WEEKLY>_<EN|ZH|MS>_<time>UTC` holding an `.html` and a `.json` with the same
+  report ID (the HTML records the SHA-256 of the JSON). No AI call is needed.
+- **Include the AI interpretation** can be ticked only while an AI reply exists that was accepted for exactly the
+  facts on screen (same data basis, same digest, same session). It is saved as a separate, UNVERIFIED section in the
+  reply's language and never changes a statistic. Rejected, failed, cancelled or out-of-date replies are never kept.
+- **E-mail draft (.eml)…** needs a report saved from the current preview. It shows a preview: To (optional),
+  Subject, the body and the two attachments. **Save .eml draft…** then writes a new `.eml` file. The draft attaches
+  exactly that saved report, re-read and checked against the hashes recorded when it was saved; nothing else in the
+  folder is attached.
+
+What the files contain:
+- The same aggregate facts as the AI request: report type, windows, generation time, data-basis digest, history
+  coverage, sync outcomes, data-quality counts, observation counts and comparison limits.
+- UNVERIFIED, Cloud Not Verified and Observed Change ≠ Actual Consumption; unknown stays "unknown", never 0.
+- No Material IDs, descriptions, Sheet names, local paths, source-file hashes, stock rows or workbooks.
+- Chinese, English or Malay, following the current preview (or the AI reply's language when it is included).
+
+When a report can be saved:
+- Saving re-checks itself in the background, not only through the button state. Right before one no-overwrite
+  rename of a staged folder, it holds a database read lock (rollback journal only; a WAL database is refused) and
+  then the assistant session lock.
+- The data basis must be unchanged and the session must still hold the same local-data authorisation. After
+  Refresh, a sync by any program, Local History cleanup, Stop, Disconnect, closing the assistant or a new permission,
+  the save is refused and asks you to build the report again.
+- Nothing existing is replaced; a failure leaves no complete-looking report; a leftover `.mrc-report-….partial`
+  staging folder is named in the message.
+
+**Never done here:** no SMTP, no mail credentials, no sending, no mail program is opened, no scheduled sending. The
+`.eml` is a local draft; mail programs may open it differently (an `X-Unsent: 1` header is set for those that
+support draft mode). Purchasing suggestions, real sending, automatic notifications and RAG remain later work, so
+M4F as a whole is not complete.
+
+**Verified this round:** synthetic workbooks and temporary databases, fake API transport, `tests.test_m4f_delivery`
+(see `M4F_DELIVERY_TEST_REPORT.md`). **Not executed:** real company data, real API, real mail clients, network or
+cloud-synchronised target folders, packaged EXE, other PCs, physical DPI.
 
 ## Safety
 

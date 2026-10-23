@@ -49,7 +49,7 @@ class ProviderFailure(Exception):
     CODES = frozenset({'OUTBOUND_CONSENT_REQUIRED', 'PROVIDER_AUTH_REQUIRED', 'PROVIDER_AUTH_FAILED',
                        'PROVIDER_RATE_LIMITED', 'PROVIDER_QUOTA_EXHAUSTED', 'PROVIDER_UNAVAILABLE',
                        'PROVIDER_TIMEOUT', 'PROVIDER_BUSY', 'PROVIDER_LIMIT', 'INVALID_PROVIDER_RESPONSE',
-                       'CANCELLED', 'OUTBOUND_DATA_REFUSED'})
+                       'CANCELLED', 'OUTBOUND_DATA_REFUSED', 'STALE_REPORT', 'NARRATIVE_REJECTED'})
 
     def __init__(self, code):
         self.code = code if code in self.CODES else 'PROVIDER_FAILED'

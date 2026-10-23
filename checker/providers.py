@@ -5,6 +5,7 @@ No request is made at import, construction or preview. Use from a host worker, n
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import http.client
 import math
 import re
@@ -16,6 +17,7 @@ import time
 from .agent import ModelReply, ProviderFailure, ToolCall
 from .agent_tools import _validate, encoded, specifications
 from .credentials import CredentialError, WindowsKeyStore, validate_key
+from . import narrative
 from .outbound import DISCLOSURE, POLICY, project, safe_text, strict_json
 from .quota import QuotaMonitor, amount
 
@@ -161,6 +163,7 @@ class DeepSeekProvider:
         self._revoked.set()
         self._requests = 0
         self._quota = self._new_quota()
+        self._narrative_authorized = False
 
     def _new_quota(self):
         return QuotaMonitor(usd=self.config.low_balance_usd, cny=self.config.low_balance_cny)
@@ -174,12 +177,28 @@ class DeepSeekProvider:
             self._revoked = threading.Event()
             self._requests = 0
             self._quota = self._new_quota()
+            self._narrative_authorized = False
             if not accepted:
                 self._revoked.set()
+
+    def authorize_narrative(self, *, policy, accepted):
+        """One-report grant after the host previews the exact aggregate payload; never authorizes chat."""
+        if policy != narrative.REPORT_POLICY or type(accepted) is not bool:
+            raise ValueError('Explicit consent to the current report policy is required.')
+        with self._lock:
+            if accepted and self._revoked.is_set():
+                return False
+            self._narrative_authorized = accepted
+            return True
+
+    def clear_narrative_authorization(self):
+        with self._lock:
+            self._narrative_authorized = False
 
     def revoke_outbound(self):
         with self._lock:
             self._revoked.set()
+            self._narrative_authorized = False
             self._quota = self._new_quota()
 
     def quota_status(self):
@@ -212,6 +231,13 @@ class DeepSeekProvider:
             raise ProviderFailure('PROVIDER_LIMIT')
         return body
 
+    def preview_narrative(self, facts, language):
+        payload = narrative.request_payload(facts, language, self.config.model, self.config.max_output_tokens)
+        body = encoded(payload).encode('utf-8')
+        if len(body) > MAX_REQUEST:
+            raise ProviderFailure('PROVIDER_LIMIT')
+        return body
+
     def complete(self, messages, tools, *, timeout, cancel):
         if not self._running.acquire(blocking=False):
             raise ProviderFailure('PROVIDER_BUSY')
@@ -220,7 +246,26 @@ class DeepSeekProvider:
         finally:
             self._running.release()
 
-    def _complete(self, messages, tools, *, timeout, cancel):
+    def complete_narrative(self, facts, language, *, expected_request_sha256, timeout, cancel):
+        if (type(expected_request_sha256) is not str or
+                not re.fullmatch(r'[0-9a-f]{64}', expected_request_sha256)):
+            raise ProviderFailure('INVALID_PROVIDER_RESPONSE')
+        if not self._running.acquire(blocking=False):
+            raise ProviderFailure('PROVIDER_BUSY')
+        try:
+            reply = self._complete(None, None, timeout=timeout, cancel=cancel,
+                                   narrative_request=(facts, language),
+                                   expected_request_sha256=expected_request_sha256)
+            if reply.calls or not reply.text.strip() or len(reply.text) > 4000:
+                raise ProviderFailure('INVALID_PROVIDER_RESPONSE')
+            if narrative.reply_problems(reply.text):  # counts or forbidden claims: discard, keep local counts
+                raise ProviderFailure('NARRATIVE_REJECTED')
+            return reply
+        finally:
+            self._running.release()
+
+    def _complete(self, messages, tools, *, timeout, cancel, narrative_request=None,
+                  expected_request_sha256=None):
         if type(timeout) not in (float, int) or not math.isfinite(timeout) or not 0 < timeout <= 60:
             raise ProviderFailure('PROVIDER_LIMIT')
         deadline = time.monotonic() + timeout
@@ -229,10 +274,18 @@ class DeepSeekProvider:
             quota = self._quota
             if revoked.is_set():
                 raise ProviderFailure('OUTBOUND_CONSENT_REQUIRED')
+            if narrative_request is not None:
+                if not self._narrative_authorized:
+                    raise ProviderFailure('OUTBOUND_CONSENT_REQUIRED')
+                self._narrative_authorized = False  # one approved summary, one API request
         cancellation = _Cancellation(cancel, revoked)
         if cancellation.is_set():
             raise ProviderFailure('CANCELLED')
-        body = self.preview(messages, tools)
+        body = (self.preview_narrative(*narrative_request) if narrative_request is not None
+                else self.preview(messages, tools))
+        if (narrative_request is not None and
+                hashlib.sha256(body).hexdigest() != expected_request_sha256):
+            raise ProviderFailure('STALE_REPORT')
         try:
             key = self._keys.load()
             if key is None:
