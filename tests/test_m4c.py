@@ -410,7 +410,8 @@ class AgentFlowTests(Base):
 
     def test_model_only_prose_does_not_become_data_answer(self):
         result = self.run_agent(ModelReply(text='A stock is 1000'))
-        self.assertEqual(result['status'], 'NEEDS_SELECTION')
+        self.assertEqual(result['status'], 'NEEDS_INPUT')
+        self.assertNotIn('1000', json.dumps(result))
         self.assertEqual(result['evidence'], [])
 
     def test_untrusted_workbook_instructions_stay_tool_data(self):

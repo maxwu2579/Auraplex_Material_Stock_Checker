@@ -7,6 +7,17 @@ COMMON = dict(HISTORY, **ALERTS)
 TEXT = {key: COMMON[key] for key in ('Material ID', 'Storage Sheet', 'Description', 'Sheet', 'Status', 'Close',
     'Show more', 'Material ID contains', 'unknown', 'Observed Change ≠ Actual Consumption')}
 TEXT.update({
+    'Not analyzed yet · Cloud Not Verified': ('尚未分析 · Cloud Not Verified', 'Belum dianalisis · Cloud Not Verified'),
+    'Not analyzed yet. Choose a range, then click Analyze.\nSpan = history days; movement = total absolute quantity changes (not stock); large change = single-step %. Review references only.': (
+        '尚未分析。选择范围后点击「分析」。\n覆盖天数 = 历史跨度；观察变化 = 可比较区间的累计绝对数量变化（不是库存数量）；大幅变化 = 单次变化百分比。仅作复核参考。',
+        'Belum dianalisis. Pilih julat, kemudian klik Analisis.\nLiputan = hari sejarah; pergerakan = jumlah perubahan mutlak kuantiti (bukan stok); perubahan besar = % satu langkah. Rujukan semakan sahaja.'),
+    'Minimum historical span needed for trend signals, not a minimum stock level.': (
+        '判断趋势所需的最少历史跨度，不是最低库存数量。', 'Liputan sejarah minimum untuk petunjuk trend, bukan paras stok minimum.'),
+    'Sum of absolute quantity changes over comparable intervals, not the stock quantity or actual consumption.': (
+        '可比较区间内累计的数量变化，不是库存数量，也不是实际消耗。', 'Jumlah perubahan mutlak kuantiti bagi sela boleh dibanding, bukan kuantiti stok atau penggunaan sebenar.'),
+    'Percentage threshold for one observed quantity change, not a confirmed business rule.': (
+        '单次观察数量变化的百分比参考阈值，不是已确认的业务规则。', 'Ambang peratus bagi satu perubahan kuantiti diperhatikan, bukan peraturan perniagaan yang disahkan.'),
+
     'Inventory Analytics — Historical / UNVERIFIED': ('库存分析 — 历史 / UNVERIFIED', 'Analisis inventori — Sejarah / UNVERIFIED'),
     'Inventory Analytics · HISTORICAL / UNVERIFIED': ('库存分析 · HISTORICAL / UNVERIFIED', 'Analisis inventori · HISTORICAL / UNVERIFIED'),
     'Not current stock · Cloud Not Verified': ('非当前库存 · Cloud Not Verified', 'Bukan stok semasa · Cloud Not Verified'),

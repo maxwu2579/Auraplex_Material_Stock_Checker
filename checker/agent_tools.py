@@ -46,7 +46,8 @@ def encoded(value):
 
 
 class ToolError(Exception):
-    def __init__(self, code, message):
+    def __init__(self, code, message, *, reason=None):
+        self.reason = reason
         self.code = code
         super().__init__(message)
 
@@ -194,17 +195,24 @@ class InventoryTools:
             if cancel is not None and cancel.is_set():
                 raise ToolError('CANCELLED', 'Request cancelled.')
             if time.monotonic() > deadline:
-                raise ToolError('LIMIT_EXCEEDED', 'Query time limit reached; no result published.')
+                raise ToolError('LIMIT_EXCEEDED', 'Query time limit reached; no result published.', reason='QUERY_TIMEOUT')
             result = {'ok': True, 'tool': name, 'status': 'UNVERIFIED', 'cloud': 'NOT_VERIFIED',
                       'observed_at': stamp(utc_now()), 'basis': basis, 'session_generation': generation,
                       'warnings': WARNINGS,
                       'provenance': metadata, 'data': data}
             result = plain(result)
+            # Alert totals are complete SQL aggregates; detail rows are a bounded preview. A row
+            # containing unusually long source text must not make an ordinary summary unavailable.
+            if name == 'get_stock_alerts':
+                rows = result['data']['recorded']['rows']
+                while rows and len(encoded(result).encode('utf-8')) > MAX_BYTES:
+                    del rows[len(rows) // 2:]
+                    result['data']['truncated'] = True
             if len(encoded(result).encode('utf-8')) > MAX_BYTES:
-                raise ToolError('LIMIT_EXCEEDED', 'Result too large; narrow the query.')
+                raise ToolError('LIMIT_EXCEEDED', 'Result too large; narrow the query.', reason='RESULT_TOO_LARGE')
             return result
         except ToolError as exc:
-            return self._error(name, exc.code, str(exc))
+            return self._error(name, exc.code, str(exc), reason=exc.reason)
         except analytics.AnalyticsCancelled:
             return self._error(name, 'CANCELLED', 'Request cancelled.')
         except analytics.AnalyticsLimit:
@@ -213,14 +221,14 @@ class InventoryTools:
             if cancel is not None and cancel.is_set():
                 return self._error(name, 'CANCELLED', 'Request cancelled.')
             if time.monotonic() - started >= budget_seconds:
-                return self._error(name, 'LIMIT_EXCEEDED', 'Query time limit reached; no result published.')
+                return self._error(name, 'LIMIT_EXCEEDED', 'Query time limit reached; no result published.', reason='QUERY_TIMEOUT')
             self.revoke()  # read failures invalidate all prior session evidence
             return self._error(name, 'DATABASE_READ_FAILED', 'Database unavailable or inconsistent; no result published.')
 
     @staticmethod
-    def _error(name, code, message):
+    def _error(name, code, message, *, reason=None):
         return {'ok': False, 'tool': name, 'status': 'UNVERIFIED', 'cloud': 'NOT_VERIFIED',
-                'warnings': list(WARNINGS), 'error': {'code': code, 'message': message}, 'data': None}
+                'warnings': list(WARNINGS), 'error': {'code': code, 'message': message, **({'reason': reason} if reason else {})}, 'data': None}
 
     @staticmethod
     def _book(conn, role):
@@ -278,7 +286,7 @@ class InventoryTools:
                                                 now=now, max_rows=200, max_changes=200, connection=conn)
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                raise ToolError('LIMIT_EXCEEDED', 'Query time limit reached; no result published.')
+                raise ToolError('LIMIT_EXCEEDED', 'Query time limit reached; no result published.', reason='QUERY_TIMEOUT')
             try:
                 result = analytics.analyze(self.database, args['days'], args.get('sheet'), key,
                                            now=now, cancel=cancel, max_rows=50_000, max_groups=200,
@@ -289,7 +297,7 @@ class InventoryTools:
                     (cancel is not None and cancel.is_set())), 1000)
             return {**plain(result), 'materials': [plain(m) for m in result.materials if m.material_key == key]}
         if name == 'get_stock_alerts':
-            state = alerts.state_in(conn, include_other_sources=False, limit=200)
+            state = alerts.state_in(conn, include_other_sources=False, limit=20)
             return {'recorded': plain(state), 'truncated': state.total_rows > len(state.rows),
                     'assessment': ('UPGRADE_REQUIRED' if state.schema < 3 else
                                    'NOT_EVALUATED' if state.latest_completed is None else 'NOT_RECHECKED'),

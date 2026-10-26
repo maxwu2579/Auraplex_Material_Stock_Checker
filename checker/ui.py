@@ -300,6 +300,10 @@ class CheckerApp:
         else:
             text = ""
         label.configure(text=text)
+        if text:
+            label.grid()
+        else:
+            label.grid_remove()
 
     def set_language(self, language):
         """An explicit language choice. A new language re-renders the interface; choosing the current one re-renders
@@ -510,17 +514,9 @@ class CheckerApp:
                               (self.settings_cache_button, "normal")]
         else:
             self._tr(ttk.Label(row, style="CardMuted.TLabel"), "needs_db").pack(anchor="w")
-        language = ttk.Frame(frame, style="Card.TFrame", padding=(16, 14))
-        language.grid(row=3, column=0, sticky="ew", pady=(12, 0))
-        heading = ttk.Label(language, style="Card.TLabel", font=("Segoe UI", 11, "bold"))
-        heading.pack(anchor="w")
-        self._tr(heading, "language")
-        note = ttk.Label(language, style="CardMuted.TLabel", justify="left")
-        note.pack(anchor="w", fill="x", pady=(6, 0))
-        self._tr(note, "lang_note")
-        self.wrapping.append(note)
-        self.preference_label = ttk.Label(language, style="CardMuted.TLabel", justify="left", foreground="#8f5200")
-        self.preference_label.pack(anchor="w", fill="x", pady=(4, 0))
+        # Language buttons remain in the header. Show preference errors only, without an empty settings card.
+        self.preference_label = ttk.Label(frame, style="CardMuted.TLabel", justify="left", foreground="#8f5200")
+        self.preference_label.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         self.wrapping.append(self.preference_label)
         self._render_preference()
         files = ttk.Frame(frame, style="Card.TFrame", padding=(16, 14))

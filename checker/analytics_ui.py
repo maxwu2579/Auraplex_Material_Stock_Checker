@@ -11,7 +11,7 @@ from .window_language import WindowLanguage
 from .core import display
 from .daily import DailyRunner
 from .history import HistoryReadError
-from .presentation import BG, MUTED, work_area
+from .presentation import BG, MUTED, Tooltip, work_area
 
 PAGE = 200
 
@@ -40,7 +40,7 @@ class AnalyticsWindow:
         top.protocol('WM_DELETE_WINDOW', self.close)
         self._build()
         self.locale.register(self.top, (self.tree,))
-        self._set_status(message("Historical observations only · Cloud Not Verified"))
+        self._set_status(message("Not analyzed yet · Cloud Not Verified"))
         self.language_changed()
         self.poll_id = top.after(50, self._poll)
 
@@ -89,16 +89,23 @@ class AnalyticsWindow:
         self.sheet_combo.grid(row=0, column=5, sticky='ew')
         rules = ttk.Frame(controls)
         rules.grid(row=1, column=0, columnspan=6, sticky='ew', pady=(5, 2))
+        rule_hints = {
+            'Min span days': 'Minimum historical span needed for trend signals, not a minimum stock level.',
+            'Low movement ≤': 'Sum of absolute quantity changes over comparable intervals, not the stock quantity or actual consumption.',
+            'Large change ≥ %': 'Percentage threshold for one observed quantity change, not a confirmed business rule.'}
         for label, variable, width in (('Min span days',self.minimum_days,4),
                                       ('Low movement ≤',self.low_movement,7), ('Large change ≥ %',self.percent,5)):
-            ttk.Label(rules, text=label, font=('Segoe UI',9)).pack(side='left', padx=(0, 4))
+            caption = ttk.Label(rules, text=label, font=('Segoe UI',9))
+            caption.pack(side='left', padx=(0, 4))
+            Tooltip(caption, lambda key=rule_hints[label]: self.locale.text(message(key)))
             ttk.Entry(rules, textvariable=variable, width=width, font=('Segoe UI',9)).pack(side='left', padx=(0, 10))
         ttk.Button(rules, text='Analyze', command=self.query, padding=(8, 1)).pack(side='left', padx=(0, 6))
         ttk.Button(rules, text='Stop', command=self.stop, padding=(8, 1)).pack(side='left')
         self.coverage = tk.Text(outer, height=3, wrap='word', font=('Segoe UI',9), relief='flat')
         self.coverage.grid(row=4, sticky='ew', pady=4)
-        self._text(self.coverage, 'Choose a range and optional exact Sheet / partial Material ID, then Analyze. '
-                   'The displayed thresholds are adjustable review heuristics, not confirmed business rules.')
+        self._text(self.coverage, 'Not analyzed yet. Choose a range, then click Analyze.\n'
+                   'Span = history days; movement = total absolute quantity changes (not stock); '
+                   'large change = single-step %. Review references only.')
         frame = ttk.Frame(outer)
         frame.grid(row=5, sticky='nsew')
         frame.rowconfigure(0, weight=1)

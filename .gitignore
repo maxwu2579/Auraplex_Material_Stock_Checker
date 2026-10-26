@@ -37,3 +37,21 @@ test-artifacts/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# Local inventory data, credentials/settings and unpublished runtime evidence
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+settings.json
+interface.json
+/audit_test_run.txt
+
+# Executables and archives belong to release assets, never source commits
+*.exe
+*.zip

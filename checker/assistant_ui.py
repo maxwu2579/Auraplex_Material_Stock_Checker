@@ -5,7 +5,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 
 from .assistant import AssistantSession
-from .assistant_language import error_text, report_state, route, tr
+from .assistant_language import error_text, report_state, route, tr, guidance_key, incomplete_draft
 from .agent import ProviderFailure
 from . import narrative, readable, report_delivery
 from .daily import DailyRunner
@@ -171,6 +171,9 @@ class AssistantLauncher:
             self.append('Assistant', error_text('INVALID_QUESTION', self.language))
             return
         self._language_for(question)
+        if incomplete_draft(question):
+            self.append('Assistant', tr(guidance_key(question), self.language))
+            return
         if self.start('current_chat', question=question):
             self.append('You', question)
             self.sent_question = (self.session.epoch, question)
@@ -535,7 +538,7 @@ class AssistantLauncher:
             result = event.result
             if event.action == 'current_chat' and self.sent_question is not None:
                 epoch, question = self.sent_question
-                if (event.epoch == epoch and result.get('status') != 'FAILED' and self.view is not None
+                if (event.epoch == epoch and result.get('status') not in ('FAILED', 'NEEDS_INPUT', 'NEEDS_ACTION') and self.view is not None
                         and self.view.input.get('1.0', 'end-1c').strip() == question):
                     self.view.input.delete('1.0', 'end')
                 self.sent_question = None
@@ -808,6 +811,8 @@ class AssistantView:
         self.input.delete('1.0', 'end')
         self.input.insert('1.0', prompts[self.host.language][index])
         self.input.focus_set()
+        if index != 1:
+            self.host.append('Assistant', tr(guidance_key(prompts[self.host.language][index]), self.host.language))
 
     def _local_tab(self):
         local = ttk.Frame(self.tabs, padding=5)

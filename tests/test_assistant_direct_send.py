@@ -30,7 +30,7 @@ class DirectSessionTests(Base):
 
     def test_first_send_and_second_send_need_no_dialog_or_quota_reset(self):
         self.service.steps = iter([(200, response()), (200, response())])
-        self.assertEqual(self.act('current_chat', question='check stock')['status'], 'NEEDS_SELECTION')
+        self.assertEqual(self.act('current_chat', question='check stock')['status'], 'NEEDS_INPUT')
         self.assertTrue(self.session.authorized)
         self.assertTrue(self.session.outbound)
         self.act('current_chat', question='check again')

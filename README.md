@@ -495,3 +495,38 @@ Chat answers, the AI-report preview, saved AI reports and the Daily Stock Summar
 - **Source switches.** Switching the stock source file (for example to `storage_test.xlsx`) is stated in the summary. The resulting record differences are listed separately as "differences caused by switching the source file" and are not counted as comparable changes; a first import is a baseline, not stock received. Summary + switch counts equal the recorded totals.
 - **Alerts.** Alert entries and distinct material IDs are shown separately and never added across categories. Unknown stays unknown, and missing or partial history never produces a "no change" conclusion.
 - **AI facts format.** The AI report facts are now format `mrc-ai-aggregate-report/2`: the same aggregate counts, with the same-source / source-switch split and distinct-ID counts added (no identifiers). VERIFIED in the daily summary only means this session checked the local files at generation time. See READABILITY_REPORT.md. Not committed.
+
+
+### Assistant query guidance and bounded alert summaries (2026-10-26)
+
+Quick questions show what must be supplied. An unfinished app-generated draft stays in the input
+and is not sent to the provider. If the provider finishes without tool evidence, the host shows a
+fixed Chinese/English/Malay clarification template instead of NO_TOOL_EVIDENCE. Provider prose is
+still not displayed as an inventory answer. Include the full material/history or product/quantity/
+Storage Sheet request when replying; conversation references are not resolved automatically.
+
+Recorded alert queries load at most 20 preview rows, retain complete aggregate counts, and reduce
+preview rows further if the serialized response would exceed the existing 128 KiB limit. Loaded
+versus total counts remain explicit. More details are available through Stock Alerts filters.
+The API tool schema and outbound projection are unchanged. Oversize and local timeout reasons
+now have distinct translated guidance; a limit failure does not trigger another model round.
+
+
+UI cleanup (2026-10-26): the duplicate Settings interface-language explanation card is removed.
+Header language buttons and language persistence remain. Preference errors are still shown when
+needed. Inventory Analytics starts with an explicit Not analyzed yet state and short parameter
+explanations in English/Chinese/Malay; hovering the three reference-rule labels shows more detail.
+Opening the window does not start an analysis. Four targeted existing tests passed (4.098 s), plus
+an isolated three-language initial-state/no-query check on synthetic data. No business rules changed.
+
+
+### Windows single-file pre-release (2026-10-26)
+
+The `v1.1.0.dev0` GitHub pre-release provides a standalone Windows EXE. Download the EXE from
+[release assets](https://github.com/maxwu2579/Auraplex_Material_Stock_Checker/releases/tag/v1.1.0.dev0)
+and double-click it; no Python or server installation is needed. A ZIP with the same EXE, instructions
+and SHA-256 checksums is also provided. This is a test pre-release; v1.0.0 remains stable.
+
+No API key or business data is bundled. Recipients select their own Excel files and enter their own
+DeepSeek key when using AI; keys stay in the current user's Windows Credential Manager. The binary
+is unsigned and second-PC/Windows 10/real API/Drive acceptance is still pending for this build.

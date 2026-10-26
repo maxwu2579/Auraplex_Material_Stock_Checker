@@ -52,6 +52,25 @@ def route(question, previous='en', preferred='auto', protected=()):
 
 
 TEXT = {
+    'ask_history': ('Which material ID would you like to check? Include 30, 60 or 90 days, for example: Show history for TEST-005 over 30 days.',
+                    '请提供材料编号和查询天数（30、60 或 90 天）。例如：查询 TEST-005 最近 30 天的历史。',
+                    'Apakah ID bahan yang hendak disemak? Sertakan 30, 60 atau 90 hari. Contoh: Sejarah TEST-005 untuk 30 hari.'),
+    'ask_product': ('Which product, production quantity and Storage Sheet should be used? For example: Estimate DEMO-SHORTAGE, quantity 5, Storage Sheet STORAGE-TEST.',
+                    '请提供产品、生产数量和库存 Sheet。例如：试算 DEMO-SHORTAGE，生产 5 件，库存 Sheet 为 STORAGE-TEST。',
+                    'Nyatakan produk, kuantiti pengeluaran dan Sheet stok. Contoh: Anggaran DEMO-SHORTAGE, kuantiti 5, Sheet stok STORAGE-TEST.'),
+    'ask_stock': ('Which material ID would you like to check? For example: Check stock for TEST-005.',
+                  '请提供材料编号。例如：查询 TEST-005 的库存。',
+                  'Apakah ID bahan yang hendak disemak? Contoh: Semak stok TEST-005.'),
+    'ask_query': ('Please specify a material ID and the query, or a product and production quantity. For example: Check stock for TEST-005.',
+                  '请补充材料编号和查询内容，或产品名称与生产数量。例如：查询 TEST-005 的库存。',
+                  'Nyatakan ID bahan dan carian, atau produk serta kuantiti pengeluaran. Contoh: Semak stok TEST-005.'),
+    'query_too_large': ('There are too many details for one reply. Open Stock Alerts to filter by material or Sheet; no stock conclusion was made.',
+                        '一次查询的明细过多。请到「库存提醒」按材料或 Sheet 筛选；本次未作库存结论。',
+                        'Terlalu banyak butiran untuk satu jawapan. Tapis mengikut bahan atau Sheet dalam Stock Alerts; tiada kesimpulan stok dibuat.'),
+    'query_timeout': ('The local query timed out. Narrow the range or try again; this is not an API credit warning.',
+                      '本机查询超时。请缩小范围或稍后重试；这不是 API 余额不足提示。',
+                      'Carian setempat tamat masa. Kecilkan julat atau cuba lagi; ini bukan amaran baki API.'),
+
     'direct_mode': ('DeepSeek on Send · recorded data only · UNVERIFIED', '发送时调用 DeepSeek · 仅已有数据 · UNVERIFIED', 'DeepSeek semasa Hantar · data direkod sahaja · UNVERIFIED'),
     'load_recorded': ('Load recorded data', '读取已有数据', 'Muat data direkod'),
     'send_disclosure': ('Send uses DeepSeek and limited inventory tool data. UNVERIFIED.',
@@ -390,3 +409,28 @@ def error_text(code, language):
                               '请求被拒绝或达到限制；请缩小范围或手动重试。',
                               'Permintaan ditolak atau had sumber dicapai. Kecilkan carian atau cuba semula secara manual.'))
     return f"{tr('error', language)} · {code}\n{detail[LANGUAGES.index(language)]}"
+
+
+def guidance_key(question):
+    """Choose only a fixed host question; never publish arbitrary provider text or invent parameters."""
+    text = question.casefold()
+    if any(x in text for x in ('历史', 'history', 'sejarah')):
+        return 'ask_history'
+    if any(x in text for x in ('产品', '试算', '缺口', 'product', 'estimate', 'produk', 'anggar')):
+        return 'ask_product'
+    if any(x in text for x in ('库存', 'stock', 'stok')):
+        return 'ask_stock'
+    return 'ask_query'
+
+
+def incomplete_draft(question):
+    """Only recognise the app's own unfinished quick-question templates (not arbitrary IDs or prose)."""
+    drafts = ('How much stock is recorded for', 'Show material history for', 'Estimate product shortage for',
+              '帮我查询库存，编号', '查询材料历史，编号', '查询产品试算缺口，产品',
+              'Berapa baki stok bagi', 'Tunjuk sejarah bahan bagi', 'Anggar kekurangan produk bagi')
+    return question.strip().casefold() in {x.casefold() for x in drafts}
+
+
+def tool_error_text(error, language):
+    key = {'RESULT_TOO_LARGE': 'query_too_large', 'QUERY_TIMEOUT': 'query_timeout'}.get(error.get('reason'))
+    return tr(key, language) if key else error_text(error.get('code', 'REQUEST_FAILED'), language)

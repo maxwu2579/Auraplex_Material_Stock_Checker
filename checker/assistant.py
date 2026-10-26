@@ -10,7 +10,7 @@ import uuid
 
 from .agent import Agent, ProviderFailure, SYSTEM
 from .agent_tools import InventoryTools, specifications, encoded
-from .assistant_language import LANGUAGES, error_text, tr
+from .assistant_language import LANGUAGES, error_text, tool_error_text, tr
 from .credentials import WindowsKeyStore
 from .history import read_view
 from . import narrative, readable
@@ -382,6 +382,9 @@ def render(result, language):
 
     Business answer first (identity, recorded quantity, location, counts), one data-status line, and only the limits
     that belong to this answer. Paths, hashes, versions, sync logs and codes stay in render_details (Evidence)."""
+    if result.get('status') == 'NEEDS_INPUT':
+        key = result.get('guidance')
+        return tr(key if key in ('ask_stock', 'ask_history', 'ask_product', 'ask_query') else 'ask_query', language)
     if result.get('status') == 'FAILED':
         return error_text(result.get('error', 'REQUEST_FAILED'), language)
     if result.get('status') == 'AUTHORIZED':
@@ -399,7 +402,7 @@ def render(result, language):
     for item in evidence:
         lines.append('')
         if not item['ok']:
-            lines.append(error_text(item['error']['code'], language))
+            lines.append(tool_error_text(item['error'], language))
             continue
         body, cut = _answer(item, language, SUMMARY_ITEMS)
         lines += body
@@ -418,7 +421,7 @@ def render_details(result, language):
     lines = []
     for item in evidence:
         if not item['ok']:
-            lines += [error_text(item['error']['code'], language), '']
+            lines += [tool_error_text(item['error'], language), '']
             continue
         body, _cut = _answer(item, language, None)
         lines += body + ['']
