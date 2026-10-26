@@ -10,10 +10,10 @@ import uuid
 
 from .agent import Agent, ProviderFailure, SYSTEM
 from .agent_tools import InventoryTools, specifications, encoded
-from .assistant_language import error_text, tr
+from .assistant_language import LANGUAGES, error_text, tr
 from .credentials import WindowsKeyStore
 from .history import read_view
-from . import narrative
+from . import narrative, readable
 from .providers import create_provider
 
 
@@ -40,7 +40,9 @@ class SessionFailure(Exception):
 class AssistantSession:
     """Owned by one chat surface; never persist conversation, permissions or database selections.
 
-    Closing/Stop/source changes revoke both permissions. A cancelled worker must exit before another
+    Closing/Stop/source changes revoke bindings and in-flight capabilities; a new explicit Send
+    rebinds recorded data without modal permission steps. Legacy guarded actions remain available.
+    A cancelled worker must exit before another
     worker can start. Network cancellation is also bounded/single-flight by the existing M4D transport.
     """
     def __init__(self, database=None, *, provider=None, key_store=None):
@@ -164,7 +166,7 @@ class AssistantSession:
             try:
                 result = self._execute(action, payload, cancel)
                 basis = result.get('basis')
-                if basis and action in ('chat', 'local', 'report_preview', 'report_narrative') and basis != self._authorized_basis:
+                if basis and action in ('chat', 'current_chat', 'local', 'report_preview', 'report_narrative') and basis != self._authorized_basis:
                     result = failure('STALE_DATA')
                 if basis and (self.tools is None or self.tools.basis() != basis):
                     result = failure('STALE_DATA')
@@ -179,9 +181,7 @@ class AssistantSession:
                 # Format bounded display strings on the worker, before taking the short publication lock.
                 try:
                     reply = render(result, language)
-                    evidence_text = json.dumps(result, ensure_ascii=False, indent=2)
-                    if len(evidence_text) > 200_000:
-                        evidence_text = evidence_text[:200_000] + '\n[DISPLAY TRUNCATED]'
+                    evidence_text = render_details(result, language)  # readable rows, data basis, canonical JSON
                 except Exception:
                     result = failure('DATABASE_READ_FAILED')
                     reply, evidence_text = error_text('DATABASE_READ_FAILED', language), ''
@@ -191,7 +191,7 @@ class AssistantSession:
                             self._revoke()
                         self._publish_selections(result)
                         self.events.put(Delivery(epoch, action, language, result, reply, evidence_text))
-                    elif action == 'authorize':
+                    elif action in ('authorize', 'current_chat', 'load_current'):
                         # Authorization may finish after invalidate(); it cannot restore old consent.
                         if self.tools is not None:
                             self.tools.revoke()
@@ -266,6 +266,33 @@ class AssistantSession:
                         self.context = context
             return {'status': 'PREVIEW' if action == 'preview_data' else 'AUTHORIZED', 'basis': basis,
                     'observation': observation, 'context': context}
+        if action in ('current_chat', 'load_current'):
+            # A deliberate Send/load action uses the current recorded snapshot. This is a host
+            # operation, never a model tool. Rebind data, but never retry a network request.
+            if action == 'current_chat':
+                question = payload.get('question')
+                if not isinstance(question, str) or not question.strip() or len(question) > 4000:
+                    return failure('INVALID_QUESTION')
+            if cancel.is_set() or self.closed:
+                return failure('CANCELLED')
+            basis = self.tools.basis()
+            if not self.authorized or basis != self._authorized_basis:
+                prepared = self._execute('authorize', {'expected_basis': basis}, cancel)
+                if prepared.get('status') != 'AUTHORIZED':
+                    return prepared
+            if cancel.is_set() or self.closed:
+                return failure('CANCELLED')
+            if action == 'load_current':
+                return {'status': 'AUTHORIZED', 'basis': self._authorized_basis}
+            with self._lock:
+                if cancel.is_set() or self.closed:
+                    return failure('CANCELLED')
+                if not self.outbound:
+                    self.provider.authorize_outbound(policy=self.provider.policy, accepted=True)
+                    self.outbound = True
+            result = self._execute('chat', payload, cancel)
+            result.setdefault('basis', self._authorized_basis)
+            return result
         if not self.authorized:
             return failure('CONSENT_REQUIRED')
         if action == 'report_preview':
@@ -351,7 +378,10 @@ class AssistantSession:
 
 
 def render(result, language):
-    """Only deterministic local evidence is rendered; arbitrary model prose is never displayed."""
+    """The chat answer: deterministic local evidence only; arbitrary model prose is never displayed.
+
+    Business answer first (identity, recorded quantity, location, counts), one data-status line, and only the limits
+    that belong to this answer. Paths, hashes, versions, sync logs and codes stay in render_details (Evidence)."""
     if result.get('status') == 'FAILED':
         return error_text(result.get('error', 'REQUEST_FAILED'), language)
     if result.get('status') == 'AUTHORIZED':
@@ -363,73 +393,385 @@ def render(result, language):
                 tr('report_review_caveat', language))
     if result.get('status') in ('KEY_SAVED', 'KEY_DELETED'):
         return tr('saved_key' if result['status'] == 'KEY_SAVED' else 'deleted_key', language)
-    lines = [tr('history', language)]
-    format_value = lambda x: tr('unknown', language) if x is None else str(x)
-    for item in result.get('evidence', ()):
+    evidence = result.get('evidence') or []
+    lines = _status_lines(evidence, language)
+    shortened = False
+    for item in evidence:
+        lines.append('')
         if not item['ok']:
             lines.append(error_text(item['error']['code'], language))
             continue
-        name, data = item['tool'], item['data']
-        lines.append(f"{name} · {tr('observed', language)}: {item['observed_at']}")
-        if name in ('search_materials', 'search_products'):
-            lines.append(tr('select', language) if data['total'] else tr('no_results', language))
-            lines.append(f"{len(data['candidates'])} / {data['total']} · truncated={data['truncated']}")
-        elif name == 'get_stock':
-            if not data['found']:
-                lines.append(tr('no_results', language))
-            for row in data['rows'][:50]:
-                value = tr('blank', language) if row['quantity'] is None else str(row['quantity'])
-                source = row['source']
-                lines += [f"{row['code']} · {row['description'] or ''}",
-                          f"{tr('raw', language)}: {value} · {row['match_status']}",
-                          f"{tr('source', language)}: {source['sheet']!r} / {source['row']} · Rack={row['rack']} · Level={row['level']}"]
-        elif name == 'get_bom':
-            lines.append(f"{data['sheet_name']!r} · {len(data['materials'])} BOM {tr('rows', language)} · UNVERIFIED_BOM")
-            for row in data['materials'][:50]:
-                qty = tr('blank', language) if row['quantity'] is None else str(row['quantity'])
-                lines.append(f"{row['code']} · QTY={qty} · {row['description'] or ''} · row={row['source']['row']}")
-        elif name == 'estimate_requirements':
-            calc = data['calculation']
-            lines.append(f"{calc['product']['sheet_name']!r} × {calc['production_count']} · ESTIMATED / UNVERIFIED")
-            lines.append(str(calc['counts']))
-            for row in calc['rows'][:50]:
-                lines.append(f"{row['bom']['code']} · {row['category']} · {tr('required', language)}={format_value(row['required'])} · "
-                             f"{tr('shortage', language)}={format_value(row['shortage'])} · {' / '.join(row['exceptions'])}")
-                if row['stock_assumed']:
-                    lines.append(tr('assumed', language))
-        elif name == 'material_history':
-            coverage = data['coverage']
-            lines.append(f"{data['material_key']} · {coverage['days']} {tr('days', language)} · {data['total_rows']} {tr('rows', language)} / {data['total_changes']} {tr('changes', language)}")
-            lines.append(f"{tr('coverage', language)}: {coverage['first_snapshot_at']} → {coverage['latest_snapshot_at']} · {tr('full', language)}={coverage['covers_full_window']}")
-            for row in data['rows'][:50]:
-                value = (tr('blank', language) if row['quantity'] is None else str(row['quantity'])) if row['kind'] == 'RECORD' else 'UNKNOWN — ' + row['kind']
-                lines.append(f"{row['observed_at']} · {row['sheet']!r} · {value} · {row['status']} · {tr('reference', language)}={row['reference']}")
-        elif name == 'material_analysis':
-            lines.append(f"{data['days']} {tr('days', language)} · {data['snapshots_in_window']} {tr('snapshots', language)}")
-            for row in data['materials'][:50]:
-                lines.append(f"{row['material_key']} · {row['sheet']!r} · {tr('movement', language)}={format_value(row['movement'])} · {tr('net', language)}={format_value(row['net_change'])}")
-                lines.append(' / '.join(row['signals']) + f" · {tr('span', language)}=" + str(row['window_span_days']))
-        elif name == 'get_stock_alerts':
-            lines.append(f"{data['assessment']} · {tr('rechecked', language)}")
-            lines.append(tr('unknown', language) if data['assessment'] in ('NOT_EVALUATED', 'UPGRADE_REQUIRED') else
-                         encoded(data['recorded']['active_counts']))
-            lines.append(tr('counts', language))
-        elif name == 'data_status':
-            lines.append('NOT_PERFORMED')
-            for role, state in data['recorded_states'].items():
-                lines.append(f"{role} · {state['state']} · {state['last_checked']}")
-        for version in item['provenance']['versions']:
-            lines.append(f"{version['role']} · v{version['id']} · {version['source_path']} · "
-                         f"sha256={version['file_sha256']} · {tr('imported', language)}={version['imported_at']}")
-        lines.append(tr('recorded_only', language))
-        for run in item['provenance']['latest_attempts']:
-            lines.append(f"{tr('recorded_sync', language)}: {run['role']} · {run['outcome']} · {run['finished_at']}")
-        shown = data.get('calculation', data)
-        if (len(shown.get('rows', ())) > 50 or len(shown.get('materials', ())) > 50 or
-                data.get('truncated') or (name == 'get_stock_alerts' and data['recorded']['total_rows'])):
-            lines.append(tr('omitted', language))
-    if not result.get('evidence'):
+        body, cut = _answer(item, language, SUMMARY_ITEMS)
+        lines += body
+        shortened = shortened or cut
+    if not evidence:
         lines.append(error_text(result.get('error') or 'NO_TOOL_EVIDENCE', language))
-    lines.append(tr('caveat', language))
+    if any(item['ok'] for item in evidence):
+        lines += ['', tr('c_details', language)]
     text = '\n'.join(lines)
     return text if len(text) <= 80_000 else text[:80_000] + '\n' + tr('omitted', language)
+
+
+def render_details(result, language):
+    """Evidence tab: every returned row in business language, then the data basis, then the canonical JSON."""
+    evidence = result.get('evidence') or []
+    lines = []
+    for item in evidence:
+        if not item['ok']:
+            lines += [error_text(item['error']['code'], language), '']
+            continue
+        body, _cut = _answer(item, language, None)
+        lines += body + ['']
+    basis = []
+    for item in evidence:
+        if not item['ok']:
+            continue
+        basis.append(f"{item['tool']} · {tr('observed', language)}: {item['observed_at']} UTC · "
+                     f"{item['status']} · {item['cloud']}")
+        for version in item['provenance']['versions']:
+            basis.append(f"{version['role']} · v{version['id']} · {version['source_path']} · "
+                         f"sha256={version['file_sha256']} · {tr('imported', language)}={version['imported_at']} UTC")
+        basis.append(tr('recorded_only', language))
+        for run in item['provenance']['latest_attempts']:
+            basis.append(f"{tr('recorded_sync', language)}: {run['role']} · {run['outcome']} · {run['finished_at']} UTC")
+        basis.append(f"basis={item['basis']}")
+        basis.extend(item['warnings'])
+        basis.append('')
+    text = '\n'.join([tr('c_details_title', language), ''] + lines + [tr('c_basis_title', language), ''] + basis +
+                     [tr('c_json_title', language), json.dumps(result, ensure_ascii=False, indent=2)])
+    return text if len(text) <= 200_000 else text[:200_000] + '\n[DISPLAY TRUNCATED]'
+
+
+SUMMARY_ITEMS = 5     # stock rows / shortages per chat answer; Evidence holds every returned row
+LIST_ITEMS = 8        # candidates, BOM rows and alerts per chat answer
+# Tools whose answer depends on the BOM source too: stock alerts include BOM coverage, data_status reports both.
+BOM_TOOLS = ('get_bom', 'estimate_requirements', 'search_products', 'get_stock_alerts', 'data_status')
+SYNC_OK = ('IMPORTED', 'UNCHANGED')
+
+
+def _status_lines(evidence, language):
+    """One data-status line for the whole answer (never repeated per tool), plus failed-sync warnings."""
+    ok = [item for item in evidence if item['ok']]
+    if not ok:
+        return [tr('c_status', language).format(asof=tr('c_asof_unknown', language))]
+    provenance = ok[0]['provenance']
+    roles = ['stock'] + (['bom'] if any(item['tool'] in BOM_TOOLS for item in ok) else [])
+    versions = {v['role']: v for v in provenance['versions']}
+    asof = ' · '.join(tr('c_asof', language).format(role=readable.label(readable.ROLE, role, language),
+                                                    time=readable.local_time(versions[role]['imported_at']))
+                      for role in roles if role in versions) or tr('c_asof_unknown', language)
+    lines = [tr('c_status', language).format(asof=asof)]
+    for role in roles:
+        if role not in versions:
+            lines.append(tr('c_never', language).format(role=readable.label(readable.ROLE, role, language)))
+    for run in provenance['latest_attempts']:
+        if run['role'] in roles and run['outcome'] not in SYNC_OK:
+            key = 'c_stale_unavailable' if run['outcome'] == 'UNAVAILABLE' else 'c_stale'
+            lines.append(tr(key, language).format(role=readable.label(readable.ROLE, run['role'], language),
+                                                  time=readable.local_time(run['finished_at'])))
+    return lines
+
+
+def _num(value):
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
+    return str(value)
+
+
+def _value(value, language):
+    return tr('unknown', language) if value is None else _num(value)
+
+
+def _stock_qty(row, language):
+    status = row.get('recorded_qty_status')
+    if status == 'BLANK' or row['quantity'] is None:
+        return tr('c_blank', language)
+    if status != 'VALID':
+        return tr('c_text_qty', language).format(raw=row['quantity'])
+    return _num(row['quantity'])
+
+
+def _more(lines, shown, loaded, total, language, hint=None):
+    """Nothing is cut silently. 'Showing X of Y; the rest is in Details' only when Details really holds all Y;
+    when the tool itself returned fewer rows than exist (its read limit), say so and give the narrowing hint."""
+    if loaded < total:
+        text = (tr('c_shown_only', language).format(shown=shown) + ' ' if shown < loaded else '')
+        text += tr('c_capped', language).format(loaded=loaded, total=total)
+        lines.append(text + (' ' + tr(hint, language) if hint else ''))
+        return True
+    if shown < total:
+        lines.append(tr('c_shown', language).format(shown=shown, total=total))
+        return True
+    return False
+
+
+def _take(rows, limit):
+    return rows if limit is None else rows[:limit]
+
+
+def _answer(item, language, limit):
+    """(lines, shortened) for one successful tool observation. limit=None lists every returned row (details)."""
+    name, data = item['tool'], item['data']
+    full = limit is None
+    cap = None if full else LIST_ITEMS
+    lines, cut = [], False
+    if name in ('search_materials', 'search_products'):
+        total, rows = data['total'], data['candidates']
+        if not total:
+            lines.append(tr('no_results', language))
+            return lines, False
+        key = ('c_candidates' if name == 'search_materials' else 'c_products') if total > 1 else 'c_one_candidate'
+        lines.append(tr(key, language).format(total=total))
+        for row in _take(rows, cap):
+            label = row.get('material_id') or row.get('display_name') or row['sheet']
+            lines.append(f"• {label} · Sheet {row['sheet']!r}")
+        cut = _more(lines, len(_take(rows, cap)), len(rows), total, language, 'c_narrow_search')
+        if total > 1:
+            lines.append(tr('select', language))
+    elif name == 'get_stock':
+        rows = data['rows']
+        if not data['found']:
+            lines.append(tr('c_not_found', language).format(id=data['material_id']))
+            return lines, False
+        duplicated = max(r['duplicate_rows_in_sheet'] for r in rows)
+        sheets = {r['source']['sheet'] for r in rows}
+        if duplicated > 1:
+            lines.append(tr('c_duplicate', language).format(id=data['material_id'], count=len(rows)))
+        elif len(sheets) > 1:
+            lines.append(tr('c_sheets', language).format(id=data['material_id'], count=len(sheets)))
+        for row in _take(rows, limit):
+            description = row['description'] if row['description'] not in (None, '') else '—'
+            lines.append(f"• {row['code']} · {description}")
+            place = [f"{tr('raw', language)}{'：' if language == 'zh' else ': '}{_stock_qty(row, language)}"]
+            if row.get('rack') not in (None, '') or row.get('level') not in (None, ''):
+                place.append(tr('c_location', language).format(rack=_value(row.get('rack'), language),
+                                                               level=_value(row.get('level'), language)))
+            place.append(tr('c_source_row', language).format(sheet=row['source']['sheet'], row=row['source']['row']))
+            if full:
+                place.append(f"{row['match_status']} · quantity_type={row['quantity_type']}")
+            lines.append('  ' + ' · '.join(place))
+        cut = _more(lines, len(_take(rows, limit)), len(rows), len(rows), language)
+    elif name == 'get_bom':
+        rows = data['materials']
+        lines.append(tr('c_bom', language).format(product=data['display_name'], count=len(rows)))
+        for row in _take(rows, cap):
+            qty = (tr('c_bom_qty_blank', language) if row['quantity'] is None else
+                   tr('c_bom_qty', language).format(qty=_num(row['quantity'])))
+            lines.append(f"• {row['code']} · {qty} · {row['description'] or '—'}" +
+                         (f" · row={row['source']['row']}" if full else ''))
+        cut = _more(lines, len(_take(rows, cap)), len(rows), len(rows), language)
+    elif name == 'estimate_requirements':
+        lines, cut = _estimate(data['calculation'], language, limit)
+    elif name == 'material_history':
+        lines, cut = _history(data, language, limit)
+    elif name == 'material_analysis':
+        lines, cut = _analysis(data, language, limit)
+    elif name == 'get_stock_alerts':
+        lines, cut = _alerts(data, language, limit)
+    elif name == 'data_status':
+        for role, state in data['recorded_states'].items():
+            lines.append('• ' + tr('c_role_state', language).format(
+                role=readable.label(readable.ROLE, role, language),
+                state=SYNC_STATES.get(state['state'], (state['state'],) * 3)[LANGUAGES.index(language)],
+                checked=readable.local_time(state['last_checked']) or '—',
+                imported=readable.local_time(state['data_imported']) or '—'))
+        lines.append(tr('recorded_only', language))
+    return lines, cut
+
+
+def _estimate(calc, language, limit):
+    rows = calc['rows']
+    by = {category: [r for r in rows if r['category'] == category] for category in ('SHORTAGE', 'EXCEPTION', 'ENOUGH')}
+    product = calc['product']['display_name']
+    lines = [tr('c_estimate', language).format(product=product, count=calc['production_count'],
+                                              short=len(by['SHORTAGE']), exceptions=len(by['EXCEPTION']),
+                                              enough=len(by['ENOUGH']))]
+    cut = False
+    describe = lambda r: f"{r['bom']['code']} · {r['bom']['description'] or '—'}"
+    if limit is None:
+        for r in rows:
+            lines.append(f"• {describe(r)} · {CATEGORY[r['category']][LANGUAGES.index(language)]} · "
+                         f"{tr('required', language)} {_value(r['required'], language)} · "
+                         f"{tr('shortage', language)} {_value(r['shortage'], language)}" +
+                         (' · ' + ' / '.join(r['exceptions']) if r['exceptions'] else ''))
+            if r['stock_assumed']:
+                lines.append('  ' + tr('assumed', language))
+            lines.extend('  ' + issue for issue in r['issues'])
+    else:
+        if by['SHORTAGE']:
+            lines.append(tr('c_short_title', language))
+            for r in by['SHORTAGE'][:limit]:
+                lines.append(f"• {describe(r)}: {tr('required', language)} {_value(r['required'], language)} · "
+                             f"{tr('shortage', language)} {_value(r['shortage'], language)}")
+            cut = _more(lines, min(limit, len(by['SHORTAGE'])), len(by['SHORTAGE']), len(by['SHORTAGE']), language)
+        else:
+            lines.append(tr('c_no_short', language))
+        if by['EXCEPTION']:
+            lines.append(tr('c_exc_title', language))
+            for r in by['EXCEPTION'][:limit]:
+                reasons = ' / '.join(EXCEPTIONS.get(x, (x,) * 3)[LANGUAGES.index(language)] for x in r['exceptions'])
+                lines.append(f"• {describe(r)}: {reasons}")
+            cut = _more(lines, min(limit, len(by['EXCEPTION'])), len(by['EXCEPTION']), len(by['EXCEPTION']),
+                        language) or cut
+    lines.append(tr('c_estimate_note', language))
+    return lines, cut
+
+
+def _history(data, language, limit):
+    coverage = data['coverage']
+    lines = [tr('c_history', language).format(id=data['material_key'], days=coverage['days'],
+                                              changes=data['total_changes'], rows=data['total_rows'])]
+    if coverage['first_snapshot_at'] is None:
+        lines.append(tr('c_history_none', language))
+    elif not coverage['covers_full_window']:
+        lines.append(tr('c_history_short', language).format(time=readable.local_time(coverage['first_snapshot_at']),
+                                                             days=coverage['days']))
+    if coverage['source_switches']:
+        lines.append(tr('c_history_switch', language).format(count=len(coverage['source_switches'])))
+    if data['rows'] and limit is not None:
+        lines += _latest_observation(data['rows'], language, limit)
+    changes = _take(data['changes'], limit)  # newest first
+    for change in changes:
+        before = _change_side(change['before_status'], change['before_value'], change['before_raw'], language)
+        after = _change_side(change['after_status'], change['after_value'], change['after_raw'], language)
+        lines.append(f"• {readable.local_time(change['after_at'])} · "
+                     f"{readable.label(readable.CHANGE, change['change_type'], language)}: {before} → {after}" +
+                     (f" · {change['note']}" if limit is None else ''))
+    cut = _more(lines, len(changes), len(data['changes']), data['total_changes'], language, 'c_narrow_history')
+    if limit is None:
+        _more(lines, len(data['rows']), len(data['rows']), data['total_rows'], language, 'c_narrow_history')
+        for row in data['rows']:
+            value = _history_qty(row, language) if row['kind'] == 'RECORD' else 'UNKNOWN — ' + row['kind']
+            lines.append(f"  {row['observed_at']} UTC · {row['sheet']!r} · {value} · {row['status']} · "
+                         f"{tr('reference', language)}={row['reference']}")
+        lines.extend('  ' + note for note in coverage['notes'])
+    return lines, cut
+
+
+def _latest_observation(rows, language, limit):
+    """Rows are newest first and one snapshot may hold several Sheet rows. The newest snapshot is described as it
+    is - found, not found, or cleaned up (unknown) - never skipped in favour of an older number. When it holds no
+    record, the last recorded quantities follow, with their own time and, if different, their source file."""
+    newest = [r for r in rows if r['snapshot_id'] == rows[0]['snapshot_id']]
+    when = readable.local_time(rows[0]['observed_at'])
+    found = [r for r in newest if r['kind'] == 'RECORD']
+    if found:
+        return [tr('c_latest', language).format(time=when, qty=_history_qty(r, language), sheet=r['sheet'])
+                for r in found[:limit]]
+    lines = [tr('c_latest_pruned' if newest[0]['kind'] == 'NOT_RETAINED' else 'c_latest_absent',
+                language).format(time=when)]
+    earlier = [r for r in rows if r['kind'] == 'RECORD']
+    if earlier:
+        for r in [r for r in earlier if r['snapshot_id'] == earlier[0]['snapshot_id']][:limit]:
+            line = tr('c_last_qty', language).format(time=readable.local_time(r['observed_at']),
+                                                     qty=_history_qty(r, language), sheet=r['sheet'])
+            if r['source_path'] != rows[0]['source_path']:
+                line += tr('c_other_source', language).format(file=readable.file_name(r['source_path']))
+            lines.append(line)
+    return lines
+
+
+def _change_side(status, value, raw, language):
+    if status is None:
+        return '—'
+    if status == 'VALID' and value is not None:
+        return _num(value)
+    if status == 'BLANK':
+        return tr('c_blank', language)
+    return tr('c_text_qty', language).format(raw=' | '.join('—' if x is None else _num(x) for x in raw) or '—')
+
+
+def _history_qty(row, language):
+    if row['status'] == 'BLANK' or row['quantity'] is None:
+        return tr('c_blank', language)
+    if row['status'] != 'VALID':
+        return tr('c_text_qty', language).format(raw=row['quantity'])
+    return _num(row['quantity'])
+
+
+def _analysis(data, language, limit):
+    lines = []
+    materials = data['materials']
+    for row in _take(materials, limit):
+        lines.append(tr('c_analysis', language).format(
+            id=row['material_key'], sheet=row['sheet'], days=data['days'], movement_label=tr('movement', language),
+            movement=_value(row['movement'], language), net_label=tr('net', language),
+            net=_value(row['net_change'], language), span=_value(row['window_span_days'], language)))
+        signals = [SIGNALS.get(s, (s,) * 3)[LANGUAGES.index(language)] for s in row['signals']]
+        if signals:
+            lines.append('  ' + ' · '.join(signals) + (f" ({' / '.join(row['signals'])})" if limit is None else ''))
+    if not materials:
+        lines.append(tr('no_results', language))
+    cut = _more(lines, len(_take(materials, limit)), len(materials), len(materials), language)
+    lines.append(tr('c_observed', language))
+    return lines, cut
+
+
+def _alerts(data, language, limit):
+    assessment, recorded = data['assessment'], data['recorded']
+    if assessment == 'UPGRADE_REQUIRED':
+        return [tr('c_alerts_upgrade', language)] + ([f"({assessment})"] if limit is None else []), False
+    if assessment == 'NOT_EVALUATED':
+        return [tr('c_alerts_not_evaluated', language)] + ([f"({assessment})"] if limit is None else []), False
+    completed = recorded.get('latest_completed') or {}
+    lines = [tr('c_alerts', language).format(time=readable.local_time(completed.get('finished_at')) or '—')]
+    counts = recorded['active_counts']
+    for kind in readable.ALERT:
+        lines.append('• ' + tr('c_alert_count', language).format(label=readable.label(readable.ALERT, kind, language),
+                                                                 count=counts.get(kind, 0)))
+    lines.append(tr('counts', language))
+    order = {kind: i for i, kind in enumerate(readable.ALERT)}
+    rows = sorted(recorded['rows'], key=lambda r: order.get(r['alert_type'], len(order)))
+    cap = None if limit is None else LIST_ITEMS
+    for row in _take(rows, cap):
+        lines.append(f"• {readable.label(readable.ALERT, row['alert_type'], language)} · "
+                     f"{row['material_key'] or '—'} · Sheet {row['stock_sheet']!r}" +
+                     (f" · {row['alert_type']}/{row['subtype']}" if limit is None else ''))
+    cut = _more(lines, len(_take(rows, cap)), len(rows), recorded['total_rows'], language, 'c_narrow_alerts')
+    return lines, cut
+
+
+CATEGORY = {'SHORTAGE': ('short', '缺料', 'kurang'), 'EXCEPTION': ('exception', '异常', 'pengecualian'),
+            'ENOUGH': ('enough', '足够', 'mencukupi')}
+EXCEPTIONS = {
+    'INVALID_MATERIAL_ID': ('invalid Material ID', '材料编号无效', 'ID bahan tidak sah'),
+    'CODE_TYPE_MISMATCH': ('ID stored as a number on one side', '编号格式不一致（数字/文本）',
+                           'ID disimpan sebagai nombor di satu pihak'),
+    'INVALID_BOM_QTY': ('invalid BOM quantity', 'BOM 用量无效', 'kuantiti BOM tidak sah'),
+    'DUPLICATE_BOM': ('listed more than once in the BOM', 'BOM 中重复出现', 'tersenarai lebih sekali dalam BOM'),
+    'DUPLICATE_STOCK': ('several stock records, not merged', '库存有多条记录，未合并',
+                        'beberapa rekod stok, tidak digabung'),
+    'STOCK_NOT_FOUND': ('not found in the stock list (estimate assumes 0)', '库存表未找到（试算按 0 计）',
+                        'tiada dalam senarai stok (anggaran menganggap 0)'),
+    'BLANK_STOCK': ('stock not recorded yet (estimate assumes 0)', '库存尚未登记（试算按 0 计）',
+                    'stok belum direkod (anggaran menganggap 0)'),
+    'INVALID_STOCK': ('stock quantity to be confirmed (estimate assumes 0)', '库存数量待确认（试算按 0 计）',
+                      'kuantiti stok perlu disahkan (anggaran menganggap 0)'),
+}
+SIGNALS = {
+    'INSUFFICIENT_HISTORY': ('history is insufficient: no trend conclusion', '历史不足，无法得出趋势结论',
+                             'sejarah tidak mencukupi: tiada kesimpulan trend'),
+    'LOW_OBSERVED_MOVEMENT': ('little observed movement', '观察到的变动很少', 'pergerakan diperhatikan sedikit'),
+    'LONG_UNCHANGED_OBSERVATIONS': ('unchanged for a long time', '长时间没有变化', 'tidak berubah untuk tempoh lama'),
+    'POSITIVE_UNCHANGED_REVIEW': ('stock recorded but unchanged for long: worth a review', '有库存但长期未变，建议复核',
+                                  'stok direkod tetapi lama tidak berubah: wajar disemak'),
+    'LARGE_OBSERVED_CHANGE': ('a large single observed change', '有一次较大的观察变化', 'satu perubahan besar diperhatikan'),
+    'FROM_ZERO_PERCENT_UNKNOWN': ('started from 0: percentage unknown', '从 0 开始，百分比未知',
+                                  'bermula dari 0: peratus tidak diketahui'),
+    'LAST_OBSERVED_ZERO': ('last record is 0', '最近一次记录为 0', 'rekod terakhir ialah 0'),
+    'INCOMPARABLE_GAP': ('some records are not comparable', '部分记录之间不可比较', 'sesetengah rekod tidak boleh dibanding'),
+    'HISTORY_PRUNED': ('part of the history was removed by cleanup', '部分历史已被清理',
+                       'sebahagian sejarah dibuang oleh pembersihan'),
+    'OTHER_SOURCE_HISTORY': ('includes history from another source file', '包含其他数据源的历史',
+                             'termasuk sejarah daripada fail sumber lain'),
+}
+SYNC_STATES = {
+    'Local File Checked': ('last sync succeeded', '上次同步成功', 'penyegerakan terakhir berjaya'),
+    'Sync Failed': ('sync failed — earlier data in use', '同步失败——正在使用之前的数据',
+                    'penyegerakan gagal — data terdahulu digunakan'),
+    'Source File Unavailable': ('source file unavailable — earlier data in use', '源文件不可用——正在使用之前的数据',
+                           'fail sumber tidak tersedia — data terdahulu digunakan'),
+    'Source Changed — Refresh Needed': ('source changed — refresh needed', '源文件已变化——需要刷新',
+                                        'sumber berubah — perlu disegarkan'),
+    'Not Synced': ('never synchronised', '尚未同步', 'belum disegerakkan'),
+}

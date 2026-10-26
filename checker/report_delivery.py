@@ -35,7 +35,7 @@ import re
 import shutil
 import uuid
 
-from . import narrative
+from . import narrative, readable
 from .assistant_language import report_state
 from .history import HistoryReadError, read_view
 
@@ -77,6 +77,20 @@ T = {
                  "Observed Change ≠ Actual Consumption：同步版本之间的差异可能包含收货、更正和盘点。",
                  "Observed Change ≠ Actual Consumption: perbezaan antara versi Storage boleh termasuk penerimaan, "
                  "pembetulan dan kiraan semula."),
+    "summary": ("Summary", "摘要", "Ringkasan"),
+    "more": ("Statistics, data basis and technical details", "统计明细、数据依据与技术详情",
+             "Statistik, asas data dan butiran teknikal"),
+    "same": ("Same-source change events (comparable)", "同源变化条数（可比较）",
+             "Peristiwa perubahan sumber sama (boleh dibanding)"),
+    "same_ids": ("Same-source distinct material IDs", "同源变化涉及的不同编号", "ID bahan berbeza (sumber sama)"),
+    "cross": ("Differences caused by a source switch (not inventory activity)", "更换数据源造成的差异（不是库存活动）",
+              "Perbezaan akibat pertukaran sumber (bukan aktiviti inventori)"),
+    "baselines": ("First imports (baseline, not stock received)", "首次导入（基线，不是入库）",
+                  "Import pertama (garis dasar, bukan stok diterima)"),
+    "same_col": ("Same source", "同源", "Sumber sama"),
+    "cross_col": ("Source switch", "更换数据源", "Pertukaran sumber"),
+    "entries_col": ("Alert entries", "提醒条数", "Catatan amaran"),
+    "any_ids": ("Distinct material IDs with any alert", "至少有一条提醒的不同编号", "ID bahan berbeza dengan sebarang amaran"),
     "info": ("Report information", "报告信息", "Maklumat laporan"),
     "type": ("Report type", "报告类型", "Jenis laporan"),
     "generated": ("Facts generated (UTC)", "汇总生成时间（UTC）", "Fakta dijana (UTC)"),
@@ -102,7 +116,7 @@ T = {
     "by_type": ("Changes by type", "按类型的变化", "Perubahan mengikut jenis"),
     "events_col": ("Events", "事件数", "Peristiwa"),
     "comparison": ("Weekly comparison", "周对比", "Perbandingan mingguan"),
-    "delta": ("Event-count delta", "事件数差值", "Beza kiraan peristiwa"),
+    "delta": ("Event-count delta (same source)", "事件数差值（同源）", "Beza kiraan peristiwa (sumber sama)"),
     "alerts": ("Recorded alerts", "已记录提醒", "Amaran direkod"),
     "evaluated": ("Evaluated (UTC)", "评估时间（UTC）", "Dinilai (UTC)"),
     "overlap": ("Alert categories may overlap; counts are not a number of materials. Stored, not re-checked.",
@@ -179,6 +193,10 @@ LIMITS = {
     "THRESHOLDS_AND_UNITS_NOT_BUSINESS_CONFIRMED": ("Threshold meaning and units are not business-confirmed.",
                                                     "阈值含义和单位尚未经业务确认。",
                                                     "Maksud ambang dan unit belum disahkan perniagaan."),
+    "SOURCE_SWITCH_AND_BASELINE_ARE_NOT_INVENTORY_ACTIVITY": (
+        "Differences caused by switching the source file, and first imports, are not inventory activity.",
+        "更换数据源造成的差异和首次导入都不是库存活动。",
+        "Perbezaan akibat pertukaran fail sumber, dan import pertama, bukan aktiviti inventori."),
 }
 
 
@@ -263,6 +281,8 @@ def render_html(document: ReportDocument) -> str:
     kind = tx(f["period"], lang)
     title = f"{tx('title', lang)} · {kind} · UNVERIFIED"
     parts = [f"<h1>{_e(title)}</h1>", f'<div class="banner">{_e(tx("banner", lang))}</div>',
+             f"<h2>{_e(tx('summary', lang))}</h2>", readable.html_sections(readable.report_sections(f, lang)),
+             f'<details><summary>{_e(tx("more", lang))}</summary>',
              f'<p class="note">{_e(tx("observed", lang))}</p>',
              f"<h2>{_e(tx('info', lang))}</h2><table>" + _rows([
                  (tx("type", lang), f"{kind} ({f['period']})"), (tx("generated", lang), f["generated_utc"]),
@@ -278,10 +298,18 @@ def render_html(document: ReportDocument) -> str:
             (tx("coverage", lang), report_state(period["coverage"], lang)),
             (tx("snapshots", lang), period["snapshots"]), (tx("attempts", lang), period["stock_sync_attempts"]),
             (tx("checks", lang), period["successful_stock_checks"]), (tx("events", lang), period["observed_change_events"]),
-            (tx("ids", lang), period["distinct_material_ids"]), (tx("switches", lang), period["source_switches"])]) +
+            (tx("ids", lang), period["distinct_material_ids"]),
+            (tx("same", lang), period["same_source"]["events"]),
+            (tx("same_ids", lang), period["same_source"]["distinct_material_ids"]),
+            (tx("cross", lang), period["cross_source"]["events"]), (tx("switches", lang), period["source_switches"]),
+            (tx("baselines", lang), period["baseline_snapshots"])]) +
             "</table>" + f"<table><tr><th>{_e(tx('by_type', lang))}</th><th>{_e(tx('events_col', lang))}</th>"
-            f"<th>{_e(tx('ids', lang))}</th></tr>" + "".join(
-                f"<tr><td>{_e(k)}</td><td>{_e(v['events'])}</td><td>{_e(v['distinct_material_ids'])}</td></tr>"
+            f"<th>{_e(tx('ids', lang))}</th><th>{_e(tx('same_col', lang))}</th><th>{_e(tx('cross_col', lang))}</th>"
+            "</tr>" + "".join(
+                f"<tr><td>{_e(readable.label(readable.CHANGE, k, lang))} ({_e(k)})</td><td>{_e(v['events'])}</td>"
+                f"<td>{_e(v['distinct_material_ids'])}</td>"
+                f"<td>{_e(period['same_source']['changes_by_type'][k]['events'])}</td>"
+                f"<td>{_e(period['cross_source']['changes_by_type'][k]['events'])}</td></tr>"
                 for k, v in period["changes_by_type"].items()) + "</table>")
     comparison = f["comparison"]
     parts.append(f"<h3>{_e(tx('comparison', lang))}</h3><p>{_e(report_state(comparison['status'], lang))}</p>")
@@ -291,9 +319,16 @@ def render_html(document: ReportDocument) -> str:
     alerts = f["recorded_alerts"]
     parts.append(f"<h3>{_e(tx('alerts', lang))}</h3><p>{_e(report_state(alerts['status'], lang))} · "
                  f"{_e(tx('evaluated', lang))}: {_e(alerts['evaluated_utc'] or tx('unknown', lang))}</p>")
-    parts.append("<table>" + (_rows(alerts["counts_by_type"].items()) if alerts["counts_by_type"] is not None else
-                              _rows([(tx("alerts", lang), tx("unknown", lang))])) + "</table>"
-                 f"<p class=\"note\">{_e(tx('overlap', lang))}</p>")
+    if alerts["counts_by_type"] is not None:
+        parts.append(f"<table><tr><th>{_e(tx('alerts', lang))}</th><th>{_e(tx('entries_col', lang))}</th>"
+                     f"<th>{_e(tx('ids', lang))}</th></tr>" + "".join(
+                         f"<tr><td>{_e(readable.label(readable.ALERT, k, lang))} ({_e(k)})</td><td>{_e(v)}</td>"
+                         f"<td>{_e(alerts['distinct_material_ids_by_type'][k])}</td></tr>"
+                         for k, v in alerts["counts_by_type"].items()) + "</table>" +
+                     f"<p>{_e(tx('any_ids', lang))}: {_e(alerts['distinct_material_ids_any_type'])}</p>")
+    else:
+        parts.append("<table>" + _rows([(tx("alerts", lang), tx("unknown", lang))]) + "</table>")
+    parts.append(f"<p class=\"note\">{_e(tx('overlap', lang))}</p>")
     parts.append(f"<h3>{_e(tx('sync', lang))}</h3><table>" + _rows([
         (role, f"{row['outcome']} · {row['finished_utc'] or tx('unknown', lang)}")
         for role, row in f["latest_sync_attempts"].items()]) + "</table>")
@@ -306,6 +341,7 @@ def render_html(document: ReportDocument) -> str:
             for role, counts in quality["recorded_issue_rows"].items() for name, count in counts.items()]) + "</table>")
     parts.append(f"<h2>{_e(tx('limits', lang))}</h2><ul>" + "".join(
         f"<li>{_e(_limit(code, lang))} <small>({_e(code)})</small></li>" for code in f["limitations"]) + "</ul>")
+    parts.append("</details>")
     ai = d["ai_interpretation"]
     if ai is None:
         parts.append(f"<h2>{_e(tx('ai', lang))}</h2><p class=\"note\">{_e(tx('ai_none', lang))}</p>")
@@ -322,6 +358,8 @@ def render_html(document: ReportDocument) -> str:
            "padding:3px 8px;text-align:left;vertical-align:top}th{background:#f3f4f6;font-weight:600}"
            ".ai{border:2px dashed #9a6200;background:#fffaf0;padding:4px 14px;margin-top:20px}"
            "blockquote{white-space:pre-wrap;margin:8px 0}footer{margin-top:24px;font-size:11px;color:#6b7280}"
+           "ul{margin:4px 0 8px;padding-left:20px}details{margin-top:18px;border-top:1px solid #d1d5db;padding-top:6px}"
+           "summary{cursor:pointer;font-weight:600;color:#1f4f82}"
            "@media print{.banner{border-width:1px}}")
     html_lang = {"en": "en", "zh": "zh-CN", "ms": "ms"}[lang]
     return (f'<!DOCTYPE html>\n<html lang="{html_lang}"><head><meta charset="utf-8">'
@@ -498,6 +536,7 @@ def mail_body(saved: SavedReport) -> str:
     lang, f = saved.language, data["facts"]
     unknown = tx("unknown", lang)
     lines = [tx("mail_intro", lang), "", tx("mail_status", lang), tx("observed", lang), tx("mail_unknown", lang), "",
+             f"{tx('summary', lang)}:", readable.text(readable.report_sections(f, lang)), "", f"{tx('more', lang)}:",
              f"{tx('type', lang)}: {tx(f['period'], lang)} ({f['period']}) · {tx('report_id', lang)}: {data['report_id']}",
              f"{tx('generated', lang)}: {f['generated_utc']} · {tx('saved', lang)}: {data['saved_utc']}"]
     for key, period in (("current", f["current_period"]), ("previous", f["previous_period"])):
@@ -506,7 +545,9 @@ def mail_body(saved: SavedReport) -> str:
         lines += ["", f"{tx(key, lang)}: {period['window']['start_local']} → {period['window']['end_local']}",
                   f"  {tx('coverage', lang)}: {report_state(period['coverage'], lang)}",
                   f"  {tx('events', lang)}: {period['observed_change_events']} · {tx('snapshots', lang)}: "
-                  f"{period['snapshots']} · {tx('checks', lang)}: {period['successful_stock_checks']}"]
+                  f"{period['snapshots']} · {tx('checks', lang)}: {period['successful_stock_checks']}",
+                  f"  {tx('same', lang)}: {period['same_source']['events']} · {tx('cross', lang)}: "
+                  f"{period['cross_source']['events']} · {tx('baselines', lang)}: {period['baseline_snapshots']}"]
     comparison = f["comparison"]
     lines += ["", f"{tx('comparison', lang)}: {report_state(comparison['status'], lang)}"]
     if comparison["change_event_delta_by_type"] is not None:

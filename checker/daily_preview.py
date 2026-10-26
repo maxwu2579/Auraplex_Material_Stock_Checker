@@ -1,6 +1,11 @@
 """Translated on-screen projection of an immutable DailySummary. No query, save or authorization operations."""
-from . import daily, i18n
+from . import daily, i18n, readable
 from .analysis_daily_i18n import message
+
+
+def summary_text(summary, language):
+    """The short business summary shown first; the same data as render(), which holds every detail."""
+    return readable.text(readable.daily_sections(summary.data(), language))
 
 
 def render(summary, language):
@@ -63,6 +68,8 @@ def render(summary, language):
     lines.append('  ' + ' · '.join(t('{type} {changes} ({ids} IDs)', type=k, changes=value(n['changes']), ids=value(n['distinct_material_ids'])) for k, n in c['by_type'].items()))
     lines.append(t('  Total {total} · distinct Material IDs {ids} · Storage snapshots {snapshots} · source switches {switches}',
                    total=value(c['total']), ids=value(c['distinct_material_ids']), snapshots=len(c['snapshots']), switches=len(c['source_switches'])))
+    lines.append(t('  Comparable within the same source file {same} · differences caused by switching the source file {cross} (not inventory activity)',
+                   same=value(c['same_source']['total']), cross=value(c['cross_source']['total'])))
     if c['no_record_note']:
         lines.append('  ' + t('No observed change was recorded. This does not prove no warehouse movement; Storage may not have been synchronised or the file may have been unchanged.'))
     for item in c['items'][:limit]:

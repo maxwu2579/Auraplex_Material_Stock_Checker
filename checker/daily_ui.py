@@ -20,7 +20,7 @@ from tkinter import filedialog, messagebox, ttk
 from . import daily, daily_preview, i18n
 from .analysis_daily_i18n import TEXT, message
 from .window_language import WindowLanguage
-from .presentation import BG, INK, MUTED, work_area
+from .presentation import BG, INK, MUTED, fill_summary, work_area
 
 BANNER = ("DAILY STOCK SUMMARY · From synchronised Excel data · Cloud Not Verified · "
           "Observed Change ≠ Actual Consumption")
@@ -49,6 +49,7 @@ class DailySummaryWindow:
         self.stale = None            # reason the shown preview may no longer be saved
         self.saved = None
         self.last_folder = None
+        self.details_shown = False   # the preview opens on the summary; details are one click away
         self.top = top = tk.Toplevel(master)
         top.title("Daily Stock Summary")
         left, upper, width, height = work_area(top)
@@ -103,6 +104,9 @@ class DailySummaryWindow:
         ttk.Button(bar, text="▶", width=3, command=lambda: self.shift(1)).pack(side="left", padx=(2, 0))
         self.generate_button = ttk.Button(bar, text="Generate", command=self.generate, padding=(10, 1))
         self.generate_button.pack(side="left", padx=(12, 0))
+        self.details_button = ttk.Button(bar, text="Show details and data basis ▸", command=self.toggle_details,
+                                         padding=(8, 1))
+        self.details_button.pack(side="right")
         self.state = ttk.Label(outer, text="No summary generated yet.", font=("Segoe UI", 9, "bold"),
                                foreground=MUTED)
         self.state.grid(row=3, sticky="ew", pady=(6, 4))
@@ -112,7 +116,7 @@ class DailySummaryWindow:
         frame.grid(row=4, sticky="nsew")
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
-        self.preview = tk.Text(frame, wrap="word", font=("Consolas", 9), relief="flat", background="white",
+        self.preview = tk.Text(frame, wrap="word", font=("Segoe UI", 9), relief="flat", background="white",
                                foreground=INK, padx=8, pady=6, state="disabled")
         self.preview.grid(row=0, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(frame, orient="vertical", command=self.preview.yview)
@@ -345,10 +349,23 @@ class DailySummaryWindow:
             self._refresh_state()
 
     # ------------------------------------------------------------------ rendering
+    def toggle_details(self):
+        self.details_shown = not self.details_shown
+        self.locale.label(self.details_button, message("Hide details ▾" if self.details_shown else
+                                                       "Show details and data basis ▸"))
+        self.preview.tag_configure("details", elide=not self.details_shown)
+
     def _set_preview(self, value):
+        """The summary of the immutable summary first; its complete preview (render) below, collapsed. A plain value
+        (an empty preview after a failure) is shown as it is."""
         self.preview_source = value if isinstance(value, daily.DailySummary) else None
-        text = daily_preview.render(value, self.owner.language.language) if self.preview_source is not None else value
-        self.locale.body(self.preview, text)
+        if self.preview_source is None:
+            fill_summary(self.preview, self.locale.text(value))
+            return
+        language = self.owner.language.language
+        fill_summary(self.preview, daily_preview.summary_text(value, language), daily_preview.render(value, language),
+                     self.tr("Details and data basis (every loaded row; saved HTML/JSON keep the English report format)"),
+                     self.details_shown)
 
     def _refresh_state(self):
         if self.closed:

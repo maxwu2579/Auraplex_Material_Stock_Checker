@@ -56,6 +56,24 @@ class Tooltip:
             self.window = None
 
 
+def fill_summary(widget, summary, details="", title="", expanded=False):
+    """Read-only Text: the summary first, then the details under a title. The details stay in the widget but are
+    hidden (elided) until expanded, so opening a report never starts with logs or hundreds of rows."""
+    view = widget.yview()
+    widget.configure(state="normal")
+    widget.delete("1.0", "end")
+    widget.insert("1.0", summary)
+    widget.tag_configure("summary_title", font=("Segoe UI", 9, "bold"))
+    widget.tag_configure("details", elide=not expanded)
+    if details:
+        widget.insert("end", "\n\n")
+        widget.insert("end", (title + "\n") if title else "", ("details", "summary_title"))
+        widget.insert("end", details, ("details",))
+    widget.configure(state="disabled")
+    if view:
+        widget.yview_moveto(view[0])
+
+
 def work_area(root):
     """Use Windows' work area, including the taskbar, without changing DPI settings."""
     if root.tk.call("tk", "windowingsystem") == "win32":

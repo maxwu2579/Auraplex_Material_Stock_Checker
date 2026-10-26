@@ -406,7 +406,8 @@ class SaveTests(DailyBase):
         self.assertIn('Stock &lt;b&gt;&amp;&quot;', page)
         tags = set(re.findall(r'<([a-zA-Z0-9]+)', page))
         self.assertLessEqual(tags, {'html', 'head', 'meta', 'title', 'style', 'body', 'h1', 'h2', 'h3', 'div', 'p',
-                                    'b', 'dl', 'dt', 'dd', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'footer'})
+                                    'b', 'dl', 'dt', 'dd', 'table', 'thead', 'tbody', 'tr', 'th', 'td', 'footer',
+                                    'details', 'summary', 'ul', 'li'})
         for external in ('http://', 'https://', 'src=', 'href=', '@import', 'url(', '<link'):
             self.assertNotIn(external, page.replace('src=x', ''))
         # JSON keeps the original text unchanged (escaping is an HTML concern only)

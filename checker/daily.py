@@ -42,7 +42,7 @@ import shutil
 import threading
 import uuid
 
-from . import alerts
+from . import alerts, readable
 from .core import display
 from .history import HistoryReadError, _change, read_view
 from .inventory_db import ALERT_SCHEMA_VERSION, decode, schema_version, source_identity, stamp, utc_now
@@ -411,6 +411,19 @@ def _changes(conn, window) -> dict:
                                               " GROUP BY c.change_type", args):
         by_type[kind] = dict(changes=count, distinct_material_ids=distinct)
     total, distinct = conn.execute("SELECT count(*), count(DISTINCT c.material_key)" + joins, args).fetchone()
+    # The same complete counts split by whether the snapshot switched source file (read-only aggregate; never derived
+    # from the listed rows, which may be truncated). Baseline snapshots record no change rows.
+    sides = {side: dict(total=0, distinct_material_ids=0,
+                        by_type={t: dict(changes=0, distinct_material_ids=0) for t in CHANGE_TYPES})
+             for side in ("same_source", "cross_source")}
+    switched = "coalesce(s.same_source_path, 1) = 0"
+    for crossed, kind, count, ids in conn.execute(f"SELECT {switched}, c.change_type, count(*),"
+                                                  " count(DISTINCT c.material_key)" + joins + " GROUP BY 1, 2", args):
+        sides["cross_source" if crossed else "same_source"]["by_type"][kind] = dict(changes=count,
+                                                                                   distinct_material_ids=ids)
+    for crossed, count, ids in conn.execute(f"SELECT {switched}, count(*), count(DISTINCT c.material_key)" + joins +
+                                            " GROUP BY 1", args):
+        sides["cross_source" if crossed else "same_source"].update(total=count, distinct_material_ids=ids)
     items = []
     for r in conn.execute("SELECT c.*, s.observed_at, s.same_source_path, pv.imported_at AS before_at,"
                           " pv.source_path AS before_path, av.source_path AS after_path" + joins +
@@ -440,7 +453,8 @@ def _changes(conn, window) -> dict:
                         removed=s["removed_count"], validity_changed=s["validity_changed_count"],
                         duplicate_changed=s["duplicate_changed_count"])))
     return dict(caveat=OBSERVED_NOT_CONSUMPTION, detail=OBSERVED_CHANGE_CAVEAT, by_type=by_type, total=total,
-                distinct_material_ids=distinct, items=items, truncated=total > len(items), snapshots=snapshots)
+                distinct_material_ids=distinct, items=items, truncated=total > len(items), snapshots=snapshots,
+                **sides)
 
 
 def _limitations(conn, window) -> dict:
@@ -646,7 +660,9 @@ table{border-collapse:collapse;width:100%;margin:6px 0 10px;font-size:12px}th,td
 padding:3px 6px;text-align:left;vertical-align:top;word-break:break-word}th{background:#eaf0f5}
 dl{display:grid;grid-template-columns:max-content 1fr;gap:2px 12px;margin:4px 0}dt{font-weight:bold}dd{margin:0}
 footer{margin-top:24px;font-size:11px;color:#687789}@media print{body{margin:10mm}.banner{border-width:1px}
-tr{page-break-inside:avoid}}
+tr{page-break-inside:avoid}}ul{margin:4px 0 8px;padding-left:20px}
+details{margin:14px 0;border-top:1px solid #ccd5df;padding-top:4px}summary{cursor:pointer;font-size:15px;
+font-weight:bold;color:#1f4f82}
 """
 
 
@@ -675,8 +691,10 @@ def render_html(summary: DailySummary) -> str:
                      f"{_e(CLOUD_NOT_VERIFIED)}</div>")
     parts.append(f'<div class="note">{_e(CLOUD_NOT_VERIFIED)}: the Google Drive cloud copy is never checked. '
                  f'{_e(OBSERVED_NOT_CONSUMPTION)}.</div>')
+    # Summary first; every full section below is collapsed and holds every loaded row.
+    parts.append("<h2>Summary</h2>" + readable.html_sections(readable.daily_sections(d, "en")))
     # 1. report information
-    parts.append("<h2>1. Report information</h2>")
+    parts.append("<details><summary>1. Report information and sources</summary>")
     parts.append(_dl([("Report date", d["report_date"] + (" (past date)" if d["historical_date"] else " (today)")),
                       ("Time zone", d["timezone"]["label"]),
                       ("Day window", f"{d['window']['start_local']} to {d['window']['end_local']} (exclusive) · UTC "
@@ -701,9 +719,10 @@ def render_html(summary: DailySummary) -> str:
     parts.append(_table(("Source", "Current version (at generation)", "Version in effect at end of report date",
                          "Latest check", "Last verified", "Status", "Verified in this session", "Checks on this date"),
                         rows))
+    parts.append("</details>")
     # 2. alerts
     g = a["at_generation"]
-    parts.append("<h2>2. Stock alerts</h2>")
+    parts.append("<details><summary>2. Stock alerts (every alert)</summary>")
     parts.append(f'<p class="muted">{_e(a["rules"])}</p><div class="note">{_e(a["not_normal"])}</div>')
     if not a["for_report_date"]["available"]:
         parts.append(f'<div class="banner unverified">Alerts for {_e(d["report_date"])}: NOT AVAILABLE — '
@@ -748,13 +767,16 @@ def render_html(summary: DailySummary) -> str:
                           f"v{e['stock_version_id']} / v{e['bom_version_id']}",
                           ", ".join(f"{k} {n}" for k, n in (e["counts_by_type"] or {}).items()) or "—", e["reason"])
                          for e in a["evaluations_on_date"]]))
+    parts.append("</details>")
     # 3. observed changes
-    parts.append(f"<h2>3. Observed changes on {_e(d['report_date'])}</h2>")
+    parts.append(f"<details><summary>3. Observed changes on {_e(d['report_date'])} (every change)</summary>")
     parts.append(f'<div class="note"><b>{_e(c["caveat"])}</b>. {_e(c["detail"])} {_e(c["attribution"])}</div>')
     parts.append(_table(("Change type", "Changes", "Distinct Material IDs"),
                         [(k, n["changes"], n["distinct_material_ids"]) for k, n in c["by_type"].items()]))
     parts.append(f"<p>Total observed changes: <b>{_e(c['total'])}</b> · distinct Material IDs: "
-                 f"<b>{_e(c['distinct_material_ids'])}</b></p>")
+                 f"<b>{_e(c['distinct_material_ids'])}</b> = comparable changes within the same source file: "
+                 f"<b>{_e(c['same_source']['total'])}</b> + differences caused by switching the source file (not "
+                 f"inventory activity): <b>{_e(c['cross_source']['total'])}</b></p>")
     if c["no_record_note"]:
         parts.append(f'<div class="note">{_e(c["no_record_note"])}</div>')
     if c["source_switches"]:
@@ -764,16 +786,27 @@ def render_html(summary: DailySummary) -> str:
                         [(s["observed_utc"], s["version_id"], s["file"], "yes" if s["baseline"] else "no",
                           "yes" if s["source_switched"] else "no", ", ".join(f"{k} {n}" for k, n in s["counts"].items()))
                          for s in c["snapshots"]]))
-    parts.append(_table(("Observed UTC", "Sheet", "Material ID", "Change", "Before UTC", "Before", "After",
-                         "Observed difference", "Note"),
-                        [(i["observed_utc"], i["sheet"], i["material_id"], i["change_type"], i["before_utc"],
-                          i["before"], i["after"], i["observed_difference"] or ("— " + (i["difference_reason"] or "")),
-                          i["note"]) for i in c["items"]]))
+    for switched, heading, side in ((False, "Comparable changes within the same source file", c["same_source"]),
+                                    (True, "Differences caused by switching the source file — not receipts, issues, "
+                                           "consumption, losses or purchases", c["cross_source"])):
+        listed = [i for i in c["items"] if i["source_switched"] == switched]
+        if switched and not side["total"]:
+            continue
+        parts.append(f"<h3>{_e(heading)}</h3>")
+        parts.append(_table(("Observed UTC", "Sheet", "Material ID", "Change", "Before UTC", "Before", "After",
+                             "Observed difference", "Note"),
+                            [(i["observed_utc"], i["sheet"], i["material_id"], i["change_type"], i["before_utc"],
+                              i["before"], i["after"],
+                              i["observed_difference"] or ("— " + (i["difference_reason"] or "")), i["note"])
+                             for i in listed]))
+        if side["total"] > len(listed):
+            parts.append(f"<p class='note'>Only {len(listed)} of {side['total']} are listed.</p>")
     if c["truncated"]:
         parts.append(f"<p class='note'>Only {len(c['items'])} of {c['total']} observed changes are listed.</p>")
+    parts.append("</details>")
     # 4. limitations
     h = lim["history"]
-    parts.append("<h2>4. Data limitations</h2>")
+    parts.append("<details><summary>4. Data limitations</summary>")
     parts.append(_dl([("History coverage", f"{h['coverage']} — {h['note']}"),
                       ("First / latest snapshot", f"{h['first_snapshot_utc'] or '—'} / {h['latest_snapshot_utc'] or '—'} UTC"),
                       ("Retained from", h["retained_from_utc"] or "no maintenance cleanup recorded"),
@@ -802,6 +835,7 @@ def render_html(summary: DailySummary) -> str:
     parts.append("<h3>Not calculated</h3>")
     parts.append(_table(("Field", "Value", "Reason"),
                         [(n["field"], "not calculated (not 0)", n["reason"]) for n in lim["not_calculated"]]))
+    parts.append("</details>")
     parts.append(f"<footer>Report ID {_e(d['report_id'])} · {_e(d['format'])} · data SHA-256 {_e(summary.digest)} · "
                  f"{_e(v['status'])} · {_e(CLOUD_NOT_VERIFIED)} · Generated by Material Requirement &amp; Stock "
                  "Checker (M3.2D). Read-only: Excel, stock and Drive settings were not changed.</footer>")
@@ -856,6 +890,8 @@ def render_text(summary: DailySummary, limit: int = PREVIEW_ITEMS) -> str:
     lines.append("  " + " · ".join(f"{k} {n['changes']} ({n['distinct_material_ids']} IDs)" for k, n in c["by_type"].items()))
     lines.append(f"  Total {c['total']} · distinct Material IDs {c['distinct_material_ids']} · Storage snapshots "
                  f"{len(c['snapshots'])} · source switches {len(c['source_switches'])}")
+    lines.append(f"  Comparable within the same source file {c['same_source']['total']} · differences caused by "
+                 f"switching the source file {c['cross_source']['total']} (not inventory activity)")
     if c["no_record_note"]:
         lines.append("  " + c["no_record_note"])
     for i in c["items"][:limit]:

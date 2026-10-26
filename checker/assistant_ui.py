@@ -7,10 +7,10 @@ from tkinter import filedialog, messagebox, ttk
 from .assistant import AssistantSession
 from .assistant_language import error_text, report_state, route, tr
 from .agent import ProviderFailure
-from . import narrative, report_delivery
+from . import narrative, readable, report_delivery
 from .daily import DailyRunner
 from .core import production_quantity
-from .presentation import BG, BLUE, INK, MUTED, Tooltip, work_area
+from .presentation import BG, BLUE, INK, MUTED, Tooltip, fill_summary, work_area
 from .quota import notice_text
 
 LANGUAGE_NAMES = ('Auto', 'English', '中文', 'Bahasa Melayu')
@@ -33,6 +33,7 @@ class AssistantLauncher:
         self.language, self.preferred = 'en', 'auto'
         self.draft, self.messages, self.candidates = '', [], []
         self.last_evidence = ''
+        self.sent_question = None
         self.report_facts = self.report_digest = self.report_basis = None
         self.report_epoch = None          # session epoch the shown preview belongs to
         self.report_narrative = None      # accepted AI text for exactly the shown facts, or None
@@ -170,9 +171,9 @@ class AssistantLauncher:
             self.append('Assistant', error_text('INVALID_QUESTION', self.language))
             return
         self._language_for(question)
-        if self.start('chat', question=question):
+        if self.start('current_chat', question=question):
             self.append('You', question)
-            self.view.input.delete('1.0', 'end')
+            self.sent_question = (self.session.epoch, question)
 
     def stop(self):
         self.invalidate()
@@ -532,6 +533,12 @@ class AssistantLauncher:
             return
         for event in self.session.drain():
             result = event.result
+            if event.action == 'current_chat' and self.sent_question is not None:
+                epoch, question = self.sent_question
+                if (event.epoch == epoch and result.get('status') != 'FAILED' and self.view is not None
+                        and self.view.input.get('1.0', 'end-1c').strip() == question):
+                    self.view.input.delete('1.0', 'end')
+                self.sent_question = None
             if result.get('error') in ('DATABASE_READ_FAILED', 'STALE_DATA', 'STALE_SESSION'):
                 self._forget_report()
                 if self.view is not None:
@@ -585,7 +592,7 @@ class AssistantLauncher:
                 self.view.show_evidence()
                 if 'candidates' in result or not self.session.authorized:
                     self.view.fill_candidates(self.candidates)
-                if self.candidates and 'candidates' in result:
+                if self.candidates and 'candidates' in result and event.action == 'local':
                     self.view.tabs.select(self.view.local_page)
                 elif event.action == 'local':
                     self.view.tabs.select(self.view.chat_page)
@@ -599,11 +606,12 @@ class AssistantLauncher:
             self.view.refresh_report_controls()
             if self.report_facts is not None and self.view.report_shown_language not in (None, self.language):
                 self.view.show_report(self.report_facts)  # same facts/digest; the AI language follows this preview
-            for label, text in ((self.view.banner, tr('history', self.language)), (self.view.caveat, tr('caveat', self.language))):
+            for label, text in ((self.view.banner, tr('history', self.language)), (self.view.caveat, tr('caveat', self.language)),
+                                (self.view.details_button, tr('details_button', self.language))):
                 if label.cget('text') != text:
                     label.configure(text=text)
             state = self.session.provider.quota_status()
-            info = [f"{tr('api_consent', self.language)}: {'ON' if self.session.outbound else 'OFF'} · Local: {'UNVERIFIED selected' if self.session.authorized else 'not authorized'}"]
+            info = [tr('direct_mode', self.language)]
             balance = state['balance']
             info.append(' / '.join(f"{r['currency']} {r['balance']}" for r in balance['currencies']) if balance else tr('quota_unknown', self.language))
             info.append(f"{state['checked_at'] or '—'} · {tr('due', self.language)}={state['balance_check_due']}")
@@ -653,10 +661,11 @@ class AssistantView:
         self.banner.grid(row=1, sticky='ew', pady=(6, 2))
         permissions = ttk.Frame(frame)
         permissions.grid(row=2, sticky='ew', pady=(3, 6))
-        self.history_button = ttk.Button(permissions, text='Select historical data…', command=lambda: host.start('preview_data'), padding=(6, 3))
+        self.history_button = ttk.Button(permissions, text=tr('load_recorded', host.language), command=lambda: host.start('load_current'), padding=(6, 3))
         self.history_button.pack(side='left')
+        ttk.Label(permissions, text=tr('send_disclosure', host.language), wraplength=360).pack(side='left', padx=6)
         self.ai_button = ttk.Button(permissions, text='AI permission…', command=host.authorize_api, padding=(6, 3))
-        self.ai_button.pack(side='left', padx=4)
+        # Legacy explicit-preview handler retained for compatibility; chat no longer needs this button.
         ttk.Button(permissions, text='Disconnect', command=host.stop, padding=(6, 3)).pack(side='right')
         self.tabs = ttk.Notebook(frame)
         self.tabs.grid(row=3, sticky='nsew')
@@ -682,6 +691,10 @@ class AssistantView:
         self.send_button.pack(side='right')
         self.stop_button = ttk.Button(commands, text='Stop', command=host.stop, padding=(10, 3))
         self.stop_button.pack(side='right', padx=5)
+        # Every row, the data basis and the JSON of the latest answer: one click from the short chat answer.
+        self.details_button = ttk.Button(commands, text=tr('details_button', host.language),
+                                         command=lambda: self.tabs.select(self.evidence_page), padding=(8, 3))
+        self.details_button.pack(side='right')
         self.quick = ttk.Combobox(commands, values=('Stock lookup', 'Low stock', 'History', 'Product shortage'), state='readonly', width=17)
         self.quick.set('Quick questions…')
         self.quick.pack(side='left')
@@ -691,12 +704,13 @@ class AssistantView:
         self._settings_tab()
         self._report_tab()
         evidence = ttk.Frame(self.tabs)
+        self.evidence_page = evidence
         evidence.columnconfigure(0, weight=1)
         evidence.rowconfigure(1, weight=1)
         evidence_note = ttk.Label(evidence, text='Local canonical evidence · original source values · no API export', wraplength=400)
         evidence_note.grid(row=0, sticky='ew')
         self.wrapped.append(evidence_note)
-        self.evidence = tk.Text(evidence, wrap='none', font=('Consolas', 9), state='disabled', width=28, height=5)
+        self.evidence = tk.Text(evidence, wrap='word', font=('Consolas', 9), state='disabled', width=28, height=5)
         self.evidence.grid(row=1, sticky='nsew')
         y = ttk.Scrollbar(evidence, command=self.evidence.yview)
         y.grid(row=1, column=1, sticky='ns')
@@ -736,6 +750,10 @@ class AssistantView:
         self.report_send_button = ttk.Button(controls, text=tr('report_send', self.host.language),
                                              command=self.host.send_report, padding=(6, 3))
         self.report_send_button.pack(side='right')
+        self.report_details = False        # the preview opens on the summary; details are one click away
+        self.report_details_button = ttk.Button(controls, text=tr('report_details_show', self.host.language),
+                                                command=self.toggle_report_details, padding=(6, 3))
+        self.report_details_button.pack(side='right', padx=4)
         self.report_shown_language = None  # language of the rendered preview; re-rendered after a switch
         self.report_preview = tk.Text(page, wrap='word', font=('Segoe UI', 9), width=30, height=5,
                                       background='white', foreground=INK, relief='flat', padx=8, pady=6,
@@ -946,6 +964,13 @@ class AssistantView:
         if self.report_ai_note.cget('text') != note:
             self.report_ai_note.configure(text=note)
 
+    def toggle_report_details(self):
+        self.report_details = not self.report_details
+        self.report_preview.tag_configure('details', elide=not self.report_details)
+        language = self.report_shown_language or self.host.language
+        self.report_details_button.configure(
+            text=tr('report_details_hide' if self.report_details else 'report_details_show', language))
+
     def clear_report(self):
         self.report_shown_language = None
         self.report_preview.configure(state='normal')
@@ -967,7 +992,10 @@ class AssistantView:
             lines += ['', f"{tr(title, lang)}: {period['window']['start_local']} → {period['window']['end_local']}",
                       t('rp_stats', coverage=report_state(period['coverage'], lang), snapshots=period['snapshots'],
                         attempts=period['stock_sync_attempts'], checks=period['successful_stock_checks'],
-                        events=period['observed_change_events'], ids=period['distinct_material_ids'])]
+                        events=period['observed_change_events'], ids=period['distinct_material_ids']),
+                      t('rp_split', same=period['same_source']['events'],
+                        ids=period['same_source']['distinct_material_ids'], cross=period['cross_source']['events'],
+                        baselines=period['baseline_snapshots'])]
             for kind, count in period['changes_by_type'].items():
                 lines.append(t('rp_type', kind=kind, events=count['events'], ids=count['distinct_material_ids']))
         comparison = facts['comparison']
@@ -980,7 +1008,8 @@ class AssistantView:
         if alerts['counts_by_type'] is None:
             lines.append(tr('rp_alerts_unknown', lang))
         else:
-            lines.extend(f"  {kind}: {count}" for kind, count in alerts['counts_by_type'].items())
+            lines.extend(f"  {kind}: {count} ({alerts['distinct_material_ids_by_type'][kind]} IDs)"
+                         for kind, count in alerts['counts_by_type'].items())
         lines += ['', tr('rp_sync', lang)]
         for role, sync in facts['latest_sync_attempts'].items():
             lines.append(f"  {role}: {sync['outcome']} · {sync['finished_utc'] or unknown}")
@@ -995,9 +1024,10 @@ class AssistantView:
             for name, count in counts.items():
                 lines.append(t('rp_issue', role=role, name=name, count=unknown if count is None else count))
         lines += [''] + tr('rp_limits', lang).split('\n')
-        self.report_preview.configure(state='normal')
-        self.report_preview.delete('1.0', 'end')
-        self.report_preview.insert('1.0', '\n'.join(lines))
-        self.report_preview.configure(state='disabled')
+        # Summary of the same facts first; the full figures (with canonical codes) stay below, collapsed.
+        fill_summary(self.report_preview, readable.text(readable.report_sections(facts, lang)), '\n'.join(lines),
+                     tr('report_details_title', lang), self.report_details)
+        self.report_details_button.configure(
+            text=tr('report_details_hide' if self.report_details else 'report_details_show', lang))
         self.report_shown_language = lang
         self.refresh_report_controls()

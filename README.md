@@ -293,25 +293,21 @@ Click the blue robot at the bottom right to open/collapse the assistant. Small w
 chat window; sufficiently wide windows use a side panel while keeping the checker usable. Chat,
 Local tools, Settings and Evidence are separate tabs. This is not included in the published v1.0.0 EXE.
 
-1. Click **Select historical data…**, review source files, hashes, versions, import times and recorded
-   sync states, and explicitly accept (default No). The assistant reads historical SQLite data only:
-   **UNVERIFIED / Cloud Not Verified**, even when the main checker previously checked Excel.
-   This permission is independent of the main checker's cached mode and of API transmission consent.
-2. Without an API, use **Local tools**. Choose Search material IDs or Search product Sheets, enter part
-   of the name/ID and Run. Select a real candidate, then choose stock, BOM, history, analysis or product
-   shortage estimate and Run. Estimate also requires an actual Storage Sheet and positive integer Qty.
-   Similar IDs and original Sheets stay separate. History ranges are 30/60/90 days. Recorded alerts and
-   sync status are also available. No threshold rules or calculations are changed by this UI.
-3. To use AI interpretation, save your API key in **Settings**. Enter a question in Chat, click
-   **AI permission…**, review the disclosure and exact first request, and accept separately (default No).
-   Granting permission makes no request; Send starts the authorized query. Future questions and selected
-   candidate IDs/Sheets fall within the displayed session scope. Live company-data use needs approval
-   of that scope; no real key/account or company information was used for this milestone's verification.
-4. Enter sends; Shift+Enter adds a line. Send/Run are disabled during a job. Stop, collapse/close,
-   Refresh/source changes, maintenance and database read failures revoke permissions and refuse late
-   results. A cancelled worker must finish before another starts. A subsequent query requires selecting
-   historical data again; API consent is also reset. Account top-up: **Recheck balance on next Send**
-   arms a check for the next authorized message, without sending a request itself.
+1. For AI chat, save your key in **Settings**, enter a question and click **Send**. No separate
+   historical-data or API-permission dialog is required. Send intentionally uses DeepSeek and the
+   existing bounded inventory tool projections; a visible notice describes this. Opening the assistant,
+   loading local data, and saving a key do not themselves make API requests.
+2. For offline tools, click **Load recorded data**, then choose a tool and Run. Select an actual
+   candidate for stock/BOM/history queries. Similar IDs and Sheets remain separate. All assistant data
+   remains **UNVERIFIED / Cloud Not Verified**, independent of main CHECK cached-mode permission.
+3. Enter sends; Shift+Enter adds a line. Failed questions remain in the input. Material search results
+   do not switch away from Chat; use Local tools to select ambiguous candidates.
+4. Stop, close, Refresh, source changes and read failures still cancel work and invalidate old data
+   bindings and report grants. The next deliberate Send binds the newly recorded snapshot without
+   another dialog; it does not claim the cloud is current. Changed data during a query is rejected,
+   with no automatic network retry. Consecutive sends on the same valid session do not reset quota.
+   Report-specific AI approval and main CHECK cached calculations retain their existing protections.
+   **Recheck balance on next Send** only arms the next send; it does not contact the API itself.
 
 Replies/warnings support Chinese, English and Malay. Mixed precedence is English > Malay > Chinese;
 explicit reply-language instructions override automatic routing. Known identifiers, source labels, quotes
@@ -487,3 +483,15 @@ These windows now follow the main Chinese / EN / BM selector, including open win
 ### Current localisation completion status (2026-10-23; supersedes earlier step statuses)
 
 History, Alerts, Analytics and Daily Summary follow the main Chinese / EN / BM selector; cache, retention and database-upgrade consent/preview framing is now translated too. Source values/canonical codes and original data-bearing narratives/diagnostics remain verbatim. Daily saved HTML/JSON remain English, as stated in the window. Closure/consent and Tk-object lifetime findings were reproduced and repaired; 16 distinct targeted tests have passing results in this final step. This is author source self-review, not independent/packaged acceptance. The combined patch passed independent Claude review and is included in the user-authorised local localisation commit. See SECONDARY_WINDOWS_L10N_CLAUDE_REVIEW.md and SECONDARY_WINDOWS_L10N_REVIEW.md. Four non-blocking P3 observations remain; real API and packaged acceptance are still pending.
+
+### Readable answers and reports (2026-10-23, source, awaiting review)
+
+Chat answers, the AI-report preview, saved AI reports and the Daily Stock Summary now open with a short business summary; details stay one click away.
+- **Default view.** The answer first, one data-status line (data time, UNVERIFIED / VERIFIED, Cloud Not Verified, failed sync), and only the limits that apply.
+- **Chat details.** Use the **Details** button / Evidence tab for every returned row, the data basis (paths, versions, SHA-256, sync attempts) and the original JSON.
+- **Reports.** Use **Show details** for the full figures with canonical codes. Saved HTML puts the summary first with collapsible sections; JSON still holds the complete data.
+- **Stock values.** Blank is shown as "not recorded yet (not 0)", text as "quantity to be confirmed" with the original value, duplicates as separate unmerged records, and a missing ID as "not found in the stock list (not zero stock)".
+- **Long lists.** A shortened list says "Showing X of Y".
+- **Source switches.** Switching the stock source file (for example to `storage_test.xlsx`) is stated in the summary. The resulting record differences are listed separately as "differences caused by switching the source file" and are not counted as comparable changes; a first import is a baseline, not stock received. Summary + switch counts equal the recorded totals.
+- **Alerts.** Alert entries and distinct material IDs are shown separately and never added across categories. Unknown stays unknown, and missing or partial history never produces a "no change" conclusion.
+- **AI facts format.** The AI report facts are now format `mrc-ai-aggregate-report/2`: the same aggregate counts, with the same-source / source-switch split and distinct-ID counts added (no identifiers). VERIFIED in the daily summary only means this session checked the local files at generation time. See READABILITY_REPORT.md. Not committed.

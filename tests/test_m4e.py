@@ -10,7 +10,7 @@ from tkinter import font as tkfont
 import unittest
 from unittest.mock import patch
 
-from checker.assistant import AssistantSession, render
+from checker.assistant import AssistantSession, render, render_details
 from checker.assistant_language import ERRORS, TEXT, error_text, route, tr
 from checker.assistant_ui import AssistantLauncher, TOOLS
 from checker.providers import DeepSeekProvider
@@ -169,8 +169,10 @@ class SessionTests(Base):
         for language in ('en', 'zh', 'ms'):
             text = render(result, language)
             self.assertIn('PRODUCT-1', text)
-            self.assertIn('6', text)
-            self.assertIn(tr('required', language), text)
+            self.assertIn(tr('c_no_short', language), text)
+            details = render_details(result, language)
+            self.assertIn(f"{tr('required', language)} 6", details)
+            self.assertIn(f"{tr('required', language)} 3", details)
         bom = self.act('local', tool='get_bom', candidate=token)
         self.assertEqual(len(bom['evidence'][0]['data']['materials']), 2)
 
@@ -182,7 +184,8 @@ class SessionTests(Base):
             self.assertIn('UNVERIFIED', render(result, 'ms'))
         result = self.act('local', tool='get_stock_alerts')
         self.assertEqual(result['evidence'][0]['data']['assessment'], 'NOT_EVALUATED')
-        self.assertIn('NOT_EVALUATED', render(result, 'zh'))
+        self.assertIn(tr('c_alerts_not_evaluated', 'zh'), render(result, 'zh'))
+        self.assertIn('NOT_EVALUATED', render_details(result, 'zh'))
 
     def test_cache_and_outbound_permissions_are_separate_and_restarts_deny(self):
         self.assertTrue(self.session.allow_outbound(self.session.epoch, True))
@@ -317,7 +320,7 @@ class SessionTests(Base):
         combined = {'status': 'TOOL_RESULTS', 'evidence': stock['evidence']+analysis['evidence']+estimate['evidence']}
         for language in ('en', 'zh', 'ms'):
             text = render(combined, language)
-            self.assertIn(tr('required', language)+'=6', text)
+            self.assertIn(f"{tr('required', language)} 6", render_details(combined, language))
             self.assertIn(tr('movement', language), text)
 
 
@@ -421,18 +424,19 @@ class ViewTests(Base):
         token = view.candidate_tree.get_children()[0]
         view.candidate_tree.selection_set(token); view._selected()
         view.local_button.invoke()
-        self.pump(lambda: 'Raw recorded stock: 100' in view.transcript.get('1.0', 'end'))
+        self.pump(lambda: 'Recorded stock: 100' in view.transcript.get('1.0', 'end'))
         self.assertEqual(set(threads), {caller})
         self.assertEqual(self.service.calls, [])
 
-    def test_unconnected_send_translated_error_and_enter_shift_enter(self):
+    def test_direct_send_and_enter_shift_enter(self):
         self.host.language = 'zh'
         view = self.host.view
         view.input.insert('1.0', '帮我查询 A 的库存')
         self.assertIsNone(view._enter(SimpleNamespace(state=1)))
         self.assertEqual(view._enter(SimpleNamespace(state=0)), 'break')
-        self.pump(lambda: 'CONSENT_REQUIRED' in view.transcript.get('1.0', 'end'))
-        self.assertIn('请先明确授权', view.transcript.get('1.0', 'end'))
+        self.pump(lambda: not self.session.busy and bool(self.service.calls))
+        self.assertNotIn('CONSENT_REQUIRED', view.transcript.get('1.0', 'end'))
+        self.assertEqual(len(self.service.calls), 1)
 
     def test_small_window_and_scaling_matrix_keeps_warning_input_and_actions_visible(self):
         quota = self.session.provider._quota
